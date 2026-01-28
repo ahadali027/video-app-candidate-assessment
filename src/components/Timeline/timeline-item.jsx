@@ -116,9 +116,15 @@ const drawAudioWaveform = async (
     } else {
       const audioContext = new (window.AudioContext ||
         window.webkitAudioContext)();
-      const response = await fetch(audioUrl);
-      const arrayBuffer = await response.arrayBuffer();
-      audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+      const response = await fetch(audioUrl, {
+        cache: 'no-store',
+        credentials: 'omit',
+      }).catch(() => null);
+      if (!response || !response.ok) return [];
+      const arrayBuffer = await response.arrayBuffer().catch(() => null);
+      if (!arrayBuffer) return [];
+      audioBuffer = await audioContext.decodeAudioData(arrayBuffer).catch(() => null);
+      if (!audioBuffer) return [];
 
       // Calculate max amplitude and RMS values for the entire audio file
       const channelData = audioBuffer.getChannelData(0);
@@ -808,29 +814,26 @@ const TimelineItem = observer(
         // Calculate the actual duration of the displayed portion
         const displayDuration = item.timeFrame.end - item.timeFrame.start;
 
-        // Draw the waveform with the correct offset
+        // Draw the waveform with the correct offset (catch to avoid unhandled rejection on CORS/cache errors)
         drawAudioWaveform(
           canvasRef.current,
           item.properties?.src,
           item.properties?.audioOffset || 0,
           displayDuration
-        );
+        ).catch(() => {});
 
         // Add resize observer to handle container resizing
         const resizeObserver = new ResizeObserver(entries => {
           for (const entry of entries) {
             if (canvasRef.current) {
-              // Update canvas dimensions
               canvasRef.current.width = entry.contentRect.width;
               canvasRef.current.height = entry.contentRect.height;
-
-              // Redraw waveform with new dimensions
               drawAudioWaveform(
                 canvasRef.current,
                 item.properties?.src,
                 item.properties?.audioOffset || 0,
                 displayDuration
-              );
+              ).catch(() => {});
             }
           }
         });
@@ -869,7 +872,7 @@ const TimelineItem = observer(
           item.properties?.src,
           item.properties?.audioOffset,
           displayDuration
-        );
+        ).catch(() => {});
       }
     }, [item.properties?.audioOffset]);
 
@@ -912,16 +915,60 @@ const TimelineItem = observer(
       const dragableView = e.currentTarget.querySelector(
         `.${styles.dragableView}`
       );
+      
+      if (!dragableView) {
+        console.warn('❌ handleDirectClick: dragableView not found');
+        return;
+      }
+      
       const dragableRect = dragableView.getBoundingClientRect();
+      
+      if (!dragableRect || dragableRect.width <= 0) {
+        console.warn('❌ handleDirectClick: Invalid dragableRect', dragableRect);
+        return;
+      }
 
-      // Calculate click position relative to the dragableView
+      // Calculate split point based on click position within the element
       const clickX = e.clientX - dragableRect.left;
-      const clickPercentage = clickX / dragableRect.width;
+      const clampedClickX = Math.max(0, Math.min(clickX, dragableRect.width));
+      const clickPercentage = clampedClickX / dragableRect.width;
+      
+      const elementDuration = item.timeFrame.end - item.timeFrame.start;
+      let splitPoint = item.timeFrame.start + elementDuration * clickPercentage;
+      
+      // Ensure split point is within valid bounds
+      const MIN_DURATION = 1;
+      splitPoint = Math.max(
+        item.timeFrame.start + MIN_DURATION,
+        Math.min(splitPoint, item.timeFrame.end - MIN_DURATION)
+      );
 
-      // Calculate split point based on the element's timeframe
-      const splitPoint =
-        item.timeFrame.start +
-        (item.timeFrame.end - item.timeFrame.start) * clickPercentage;
+      console.log('✅ handleDirectClick: Calculated split point', {
+        clickX,
+        clampedClickX,
+        elementWidth: dragableRect.width,
+        clickPercentage: clickPercentage.toFixed(4),
+        elementDuration,
+        start: item.timeFrame.start,
+        end: item.timeFrame.end,
+        splitPoint,
+        itemType: item.type,
+        itemId: item.id
+      });
+
+      // Validate split point before proceeding
+      if (
+        splitPoint <= item.timeFrame.start + MIN_DURATION ||
+        splitPoint >= item.timeFrame.end - MIN_DURATION
+      ) {
+        console.warn('❌ handleDirectClick: Split point too close to edge', {
+          splitPoint,
+          start: item.timeFrame.start,
+          end: item.timeFrame.end,
+          MIN_DURATION
+        });
+        return;
+      }
 
       if (item.type === 'audio') {
         handleSplitAudio(splitPoint);
@@ -933,9 +980,13 @@ const TimelineItem = observer(
     };
 
     const handleSplitVideo = splitPoint => {
+      console.log('🎬 handleSplitVideo CALLED:', { itemType: item.type, itemId: item.id, splitPoint });
       if (item.type === 'video') {
+        console.log('🎬 Calling store.splitVideoElement');
         store.splitVideoElement(item, splitPoint);
         setIsPopupVisible(false);
+      } else {
+        console.warn('🎬 handleSplitVideo: Item type is not video', item.type);
       }
     };
 
@@ -982,9 +1033,13 @@ const TimelineItem = observer(
     };
 
     const handleSplitAudio = async splitPoint => {
+      console.log('🔊 handleSplitAudio CALLED:', { itemType: item.type, itemId: item.id, splitPoint });
       if (item.type === 'audio') {
+        console.log('🔊 Calling store.splitAudioElement');
         store.splitAudioElement(item, splitPoint);
         setIsPopupVisible(false);
+      } else {
+        console.warn('🔊 handleSplitAudio: Item type is not audio', item.type);
       }
     };
 
@@ -1104,7 +1159,14 @@ const TimelineItem = observer(
               {item.isLoading ? (
                 <div className={styles.loadingPlaceholder}>
                   <div className={styles.loadingSpinner}></div>
-                  <span className={styles.loadingText}>Loading...</span>
+                  <span className={styles.loadingText}>
+                    {item.loadingState === 'uploading' ? 'Uploading...' : 
+                     item.loadingState === 'processing' ? 'Processing...' : 
+                     item.loadingState === 'error' ? 'Error' : 'Loading...'}
+                  </span>
+                  {item.errorMessage && (
+                    <div className={styles.errorMessage}>{item.errorMessage}</div>
+                  )}
                 </div>
               ) : item.properties?.thumbnails ? (
                 <div className={styles.thumbnailsContainer}>
@@ -1950,7 +2012,22 @@ const TimelineItem = observer(
               store.endMove();
             }}
           >
-            {item.type && getItemContent(item.type, item.id)}
+            {/* Loading/Error State UI */}
+            {item.isLoading && (
+              <div className={styles.loadingState}>
+                <div className={styles.loadingSpinner} />
+                <div className={styles.loadingText}>
+                  {item.loadingState === 'uploading' ? 'Uploading...' : 
+                   item.loadingState === 'processing' ? 'Processing...' : 
+                   item.loadingState === 'error' ? 'Error' : 'Loading...'}
+                </div>
+                {item.errorMessage && (
+                  <div className={styles.errorMessage}>{item.errorMessage}</div>
+                )}
+              </div>
+            )}
+            
+            {!item.isLoading && item.type && getItemContent(item.type, item.id)}
 
             {isPopupVisible && (
               <PopupPanel

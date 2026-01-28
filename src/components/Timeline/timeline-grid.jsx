@@ -8,6 +8,11 @@ import TimelineGhostElement from './TimelineGhostElement';
 import AlignmentLines from './AlignmentLines';
 import GhostMarker from './GhostMarker';
 import InterRowDropZone from './InterRowDropZone';
+import TimelineRuler from './TimelineRuler';
+import toast from 'react-hot-toast';
+import { validateFile, detectCategory } from '../../utils/fileValidation';
+import { uploadFile } from '../../services/fileUploadService';
+import { getVideoMetadataFromUrl } from '../../utils/videoMetadata';
 
 const TimelineGrid = observer(
   ({
@@ -32,7 +37,7 @@ const TimelineGrid = observer(
 
     const rows = Array.from({ length: store.maxRows });
 
-    const getAudioDuration = file => {
+    const getAudioDurationSeconds = file => {
       return new Promise((resolve, reject) => {
         const audio = new Audio();
         audio.preload = 'metadata';
@@ -42,7 +47,7 @@ const TimelineGrid = observer(
 
         audio.onloadedmetadata = () => {
           URL.revokeObjectURL(audioUrl);
-          resolve(audio.duration);
+          resolve(audio.duration || 0);
         };
 
         audio.onerror = () => {
@@ -59,14 +64,34 @@ const TimelineGrid = observer(
       });
     };
 
+    const inferUploadCategory = file => {
+      const ft = (file.type || '').toLowerCase();
+      if (ft.startsWith('image/')) return 'image';
+      if (ft.startsWith('video/')) return 'video';
+      if (ft.startsWith('audio/')) return 'audio';
+      const n = (file.name || '').toLowerCase();
+      if (/\.(png|jpe?g|gif|bmp|webp|svg)$/.test(n)) return 'image';
+      if (/\.(mp4|avi|mov|wmv|flv|webm|mkv|m4v)$/.test(n)) return 'video';
+      if (/\.(mp3|wav|ogg|aac|flac|aiff|m4a)$/i.test(n)) return 'audio';
+      return null;
+    };
+
+    // Use shared video metadata utility for consistent audio detection
+
     const handleDragOver = e => {
       e.preventDefault();
+      const item = e.dataTransfer?.items?.[0];
+      if (!item || item.kind !== 'file') return;
 
-      if (
-        e.dataTransfer?.items?.[0]?.kind === 'file' &&
-        e.dataTransfer.items[0].type.startsWith('audio/')
-      ) {
-        setIsDraggingOver(true);
+      const type = (item.type || '').toLowerCase();
+      const isMedia =
+        type.startsWith('audio/') ||
+        type.startsWith('video/') ||
+        type.startsWith('image/');
+
+      setIsDraggingOver(isMedia);
+      if (isMedia && e.dataTransfer) {
+        e.dataTransfer.dropEffect = 'copy';
       }
     };
 
@@ -79,47 +104,213 @@ const TimelineGrid = observer(
       e.preventDefault();
       setIsDraggingOver(false);
 
-      const files = Array.from(e.dataTransfer.files || []).filter(file =>
-        file.type.startsWith('audio/')
-      );
-
-      if (!files.length) return;
+      const droppedFiles = Array.from(e.dataTransfer.files || []);
+      if (!droppedFiles.length) return;
 
       try {
-        const gridRect = gridRef.current.getBoundingClientRect();
-        const dropPositionX = (e.clientX - gridRect.left) / gridRect.width;
-        const timePosition = store.maxTime * dropPositionX;
-
-        const allElements = store.editorElements;
-
-        const findTargetRow = () => {
-          const voiceoverElements = allElements.filter(
-            el => el.type === 'audio' && el.audioType === 'voiceover'
+        const mediaFiles = droppedFiles.filter(file => {
+          const type = (file.type || '').toLowerCase();
+          const name = (file.name || '').toLowerCase();
+          const isMediaMime =
+            type.startsWith('audio/') ||
+            type.startsWith('video/') ||
+            type.startsWith('image/');
+          const isMediaExt = /\.(mp3|wav|ogg|aac|m4a|flac|aiff|mp4|mov|webm|avi|mkv|m4v|wmv|png|jpe?g|gif|bmp|webp|svg)$/i.test(
+            name
           );
+          return isMediaMime || isMediaExt;
+        });
 
-          if (voiceoverElements.length > 0) {
-            const voiceoverRows = new Set(voiceoverElements.map(el => el.row));
-            return Math.max(...Array.from(voiceoverRows)) + 1;
+        if (!mediaFiles.length) {
+          toast.error('Unsupported file type. Please drop image, video, or audio files.');
+          return;
+        }
+
+        const accepted = [];
+        const rejected = [];
+
+        for (const file of mediaFiles) {
+          const res = validateFile(file, 'All');
+          if (res.ok) accepted.push(file);
+          else rejected.push({ file, reason: res.reason });
+        }
+
+        if (rejected.length) {
+          const head = rejected
+            .slice(0, 3)
+            .map(r => `${r.file.name} — ${r.reason}`)
+            .join(', ');
+          toast.error(
+            `Some files were rejected: ${head}${rejected.length > 3 ? '…' : ''}`
+          );
+        }
+
+        if (!accepted.length) return;
+
+        // Same method as upload: end bar placement, dedicated rows per type (no combine)
+        const lastVideoEnd = () => store.getLastVideoEndTime();
+        const lastAudioEnd = () => store.getLastAudioEndTime();
+
+        for (const file of accepted) {
+          const category = detectCategory(file) || inferUploadCategory(file);
+          const logicalType = (category || '').toLowerCase();
+
+          if (!logicalType) {
+            toast.error(`Unsupported file type: ${file.name}`);
+            continue;
           }
 
-          const usedRows =
-            allElements.length > 0
-              ? new Set(allElements.map(el => el.row))
-              : new Set();
+          try {
+            const uploadType =
+              logicalType === 'image' || logicalType === 'animation'
+                ? 'image'
+                : logicalType === 'video'
+                ? 'video'
+                : logicalType === 'audio'
+                ? 'audio'
+                : null;
 
-          return usedRows.size > 0 ? Math.max(...Array.from(usedRows)) + 1 : 0;
-        };
+            if (!uploadType) {
+              toast.error(`Unsupported file type: ${file.name}`);
+              continue;
+            }
 
-        let targetRow = findTargetRow();
+            const uploadResult = await uploadFile(file, { type: uploadType });
+            const uploadedUrl =
+              uploadResult?.url ||
+              uploadResult?.file?.url ||
+              URL.createObjectURL(file);
 
-        while (allElements.some(el => el.row === targetRow)) {
-          targetRow++;
+            if (uploadType === 'image') {
+              const imageRow = store.getDedicatedImageTrackRow();
+              if (imageRow >= store.maxRows) store.maxRows = imageRow + 1;
+              // CRITICAL: Place new image AFTER the last image on the same track (sequential)
+              const lastImageEndTime = store.getLastImageEndTime(imageRow);
+              const startTime = lastImageEndTime; // Start after last image ends
+              await store.addImageLocal({
+                url: uploadedUrl,
+                minUrl: uploadResult?.thumbnail || uploadedUrl,
+                row: imageRow,
+                startTime,
+              });
+              toast.success(`Added ${file.name} to timeline (after ${(lastImageEndTime / 1000).toFixed(1)}s)`);
+            } else if (uploadType === 'audio') {
+              let durationMs = 5000;
+              if (typeof uploadResult?.duration === 'number') {
+                durationMs = uploadResult.duration * 1000;
+              } else {
+                try {
+                  const durationSec = await getAudioDurationSeconds(file);
+                  durationMs = Math.max(1000, durationSec * 1000);
+                } catch {
+                  durationMs = 5000;
+                }
+              }
+              const audioRow = store.getDedicatedAudioTrackRow();
+              if (audioRow >= store.maxRows) store.maxRows = audioRow + 1;
+              const startTime = lastAudioEnd(); // end bar (same method as upload)
+              await store.addExistingAudio({
+                base64Audio: uploadedUrl,
+                durationMs,
+                row: audioRow,
+                startTime,
+                audioType: 'music',
+                duration: durationMs,
+                id: Date.now() + Math.random().toString(36).substring(2, 9),
+                name: file.name,
+              });
+              toast.success(`Added ${file.name} to timeline`);
+            } else if (uploadType === 'video') {
+              // Determine accurate duration and whether the video actually has an audio track.
+              // Never assume "hasAudio" based solely on backend duration metadata.
+              let durationMs;
+              let hasAudio = false;
+
+              try {
+                const meta = await getVideoMetadataFromUrl(uploadedUrl);
+                durationMs = meta?.durationMs;
+                hasAudio = !!meta?.hasAudio;
+                console.log(`[Drag-Drop] Video metadata for ${file.name}:`, {
+                  durationMs,
+                  hasAudio,
+                  url: uploadedUrl.substring(0, 50) + '...'
+                });
+              } catch (err) {
+                console.warn(`[Drag-Drop] Video metadata detection failed for ${file.name}:`, err);
+                // Fallback: use backend-reported duration when metadata probe fails
+                if (typeof uploadResult?.duration === 'number') {
+                  durationMs = uploadResult.duration * 1000;
+                } else {
+                  // Reasonable default duration if nothing else is available
+                  durationMs = 10000;
+                }
+                // In fallback path we conservatively assume "no audio"
+                hasAudio = false;
+              }
+
+              // Same method as upload: dedicated rows, end bar placement
+              const videoRow = store.getDedicatedVideoTrackRow();
+              let audioRow = store.getDedicatedAudioTrackRow();
+              
+              // CRITICAL: Ensure audio row is ALWAYS different from video row
+              if (audioRow === videoRow && hasAudio) {
+                // Find next available row for audio
+                audioRow = Math.max(videoRow + 1, store.maxRows);
+              }
+              
+              if (videoRow >= store.maxRows) store.maxRows = videoRow + 1;
+              if (hasAudio && audioRow >= store.maxRows) store.maxRows = audioRow + 1;
+              const alignedStartTime = lastVideoEnd(); // end bar (where video's last part)
+
+              await store.handleVideoUploadFromUrl({
+                url: uploadedUrl,
+                title: file.name,
+                key: uploadResult?.key || null,
+                duration: durationMs,
+                row: videoRow, // Dedicated video track
+                startTime: alignedStartTime,
+                isNeedLoader: false,
+                hasSeparateAudio: hasAudio, // Pass flag to mute video if audio is extracted
+              });
+
+              // Add aligned audio clip if video has audio - CRITICAL: Separate audio track
+              if (hasAudio) {
+                try {
+                  await store.addExistingAudio({
+                    base64Audio: uploadedUrl,
+                    durationMs,
+                    row: audioRow, // Dedicated audio track (separate from video)
+                    startTime: alignedStartTime, // Same start time as video for perfect alignment
+                    audioType: 'music',
+                    duration: durationMs, // Same duration as video
+                    id: Date.now() + Math.random().toString(36).substring(2, 9),
+                    name: file.name,
+                  });
+                  console.log(`[Drag-Drop] Successfully added audio track for ${file.name} on row ${audioRow}`);
+                } catch (audioError) {
+                  console.error(`[Drag-Drop] Failed to add audio track for ${file.name}:`, audioError);
+                  toast.error(`Video added but audio extraction failed for ${file.name}`);
+                }
+              } else {
+                console.log(`[Drag-Drop] Video ${file.name} has no audio track - skipping audio extraction`);
+              }
+
+              toast.success(
+                hasAudio
+                  ? `Added video and audio from ${file.name} to timeline (aligned, separate tracks)`
+                  : `Added video ${file.name} to timeline`
+              );
+            }
+          } catch (err) {
+            console.error('Drag and drop upload error:', err);
+            toast.error(`Failed to upload ${file.name}`);
+          }
         }
 
-        for (const file of files) {
-        }
+        store.refreshElements();
       } catch (error) {
         console.error('Drag and drop processing error:', error);
+        toast.error('Failed to process dropped files');
       }
     };
 
@@ -284,32 +475,35 @@ const TimelineGrid = observer(
       };
     }, [store, overlays]);
 
-    // Helper function for type compatibility (same as in TimelineRow)
+    // Helper: same as TimelineRow — video/audio/image never combine on same row
     const areTypesCompatible = (type1, type2) => {
-      // Subtitles can only be with subtitles
-      const isType1Subtitle = type1 === 'text';
-      const isType2Subtitle = type2 === 'text';
-
-      if (isType1Subtitle || isType2Subtitle) {
-        return isType1Subtitle && isType2Subtitle;
-      }
-
-      // Animation can go anywhere (except with subtitles, handled above)
-      if (type1 === 'animation' || type2 === 'animation') {
-        return true;
-      }
-
-      // All other types (audio, video, imageUrl, image) can mix together
-      const mixableTypes = ['audio', 'video', 'imageUrl', 'image'];
-      return mixableTypes.includes(type1) && mixableTypes.includes(type2);
+      if (type1 === 'text' || type2 === 'text') return type1 === 'text' && type2 === 'text';
+      if (type1 === 'animation' || type2 === 'animation') return true;
+      const videoTypes = ['video'];
+      const audioTypes = ['audio'];
+      const imageTypes = ['imageUrl', 'image'];
+      const v1 = videoTypes.includes(type1), v2 = videoTypes.includes(type2);
+      const a1 = audioTypes.includes(type1), a2 = audioTypes.includes(type2);
+      const i1 = imageTypes.includes(type1), i2 = imageTypes.includes(type2);
+      if (v1 && (a2 || i2)) return false;
+      if (v2 && (a1 || i1)) return false;
+      if (a1 && (v2 || i2)) return false;
+      if (a2 && (v1 || i1)) return false;
+      if (i1 && (v2 || a2)) return false;
+      if (i2 && (v1 || a1)) return false;
+      return i1 && i2;
     };
 
     return (
-      <div
-        className={styles.timelineRowContainer}
-        style={{ width: `${99.95 * scale}%` }}
-        ref={gridRef}
-      >
+      <div className={styles.timelineGridContainer}>
+        {/* Timeline Ruler - shows time markers */}
+        <TimelineRuler scale={scale} />
+        
+        <div
+          className={styles.timelineRowContainer}
+          style={{ width: `${99.95 * scale}%` }}
+          ref={gridRef}
+        >
         {rows.map((_, rowIndex) => {
           const rowOverlays = overlays.filter(
             overlay => overlay.row === rowIndex
@@ -425,6 +619,7 @@ const TimelineGrid = observer(
 
         {/* Ghost Marker for hover preview */}
         <GhostMarker position={store.ghostState.ghostMarkerPosition} />
+        </div>
       </div>
     );
   }

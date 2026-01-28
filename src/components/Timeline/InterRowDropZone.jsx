@@ -727,11 +727,13 @@ const InterRowDropZone = ({
               formData.append('image', file);
               const response = await uploadImage(formData);
               if (response) {
+                // CRITICAL: Sequential placement - place new image AFTER last image on same row
+                const lastImageEndTime = store.getLastImageEndTime(targetRow);
                 await store.addImageLocal({
                   url: response.data.url,
                   minUrl: response.data.minUrl,
                   row: targetRow,
-                  startTime: 0,
+                  startTime: lastImageEndTime, // Sequential placement
                 });
               }
             } catch (error) {

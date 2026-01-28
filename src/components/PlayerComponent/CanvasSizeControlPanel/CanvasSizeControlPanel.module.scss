@@ -1,0 +1,38 @@
+@import '../../../Variables.scss';
+
+.canvasSizeControl {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  background-color: rgba(31, 41, 55, 0.8);
+  border-radius: 4px;
+}
+
+.settingsContainer {
+  position: relative;
+}
+
+.canvasSizeButton {
+  padding: 6px;
+  border-radius: 4px;
+  transition: background-color 0.2s;
+
+  &:hover {
+    background-color: rgba(255, 255, 255, 0.1);
+  }
+}
+
+.currentSizeDisplay {
+  font-size: 0.75rem;
+  color: #ffffff;
+  font-weight: 500;
+  min-width: 50px;
+  text-align: center;
+}
+
+.canvasSizeMenu {
+  min-width: 220px;
+  max-height: 400px;
+  overflow-y: auto;
+}

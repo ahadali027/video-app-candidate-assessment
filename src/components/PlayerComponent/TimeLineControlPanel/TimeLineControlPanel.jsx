@@ -9,6 +9,7 @@ import { removeSilence } from '../../../services/audioApi';
 import { StoreContext } from '../../../mobx';
 import { runInAction } from 'mobx';
 import useUploadProgress from '../../../hooks/useUploadProgress';
+import { getVideoMetadataFromUrl } from '../../../utils/videoMetadata';
 import { validateFile } from '../../../utils/fileValidation';
 import { getAcceptAttribute, formatFileSize } from '../../../utils/fileFormatters';
 import toast from 'react-hot-toast';
@@ -1044,7 +1045,7 @@ const TimeLineControlPanel = ({
   };
 
   // Upload functionality
-  const inferUploadCategory = (file) => {
+  const inferUploadCategory = file => {
     const ft = (file.type || '').toLowerCase();
     if (ft.startsWith('image/')) return 'image';
     if (ft.startsWith('video/')) return 'video';
@@ -1071,27 +1072,29 @@ const TimeLineControlPanel = ({
 
   const addFileToTimeline = async (file, uploadedUrl) => {
     const fileType = inferUploadCategory(file);
-    
-    // Create new row at the end - same logic as in TimelineRow drop zones
-    const newRow = store.maxRows;
-    
-    // Shift rows down to create space for new element
-    store.shiftRowsDown(newRow);
 
     if (fileType === 'image') {
+      // Professional track: dedicated image row, sequential placement after last image
+      const imageRow = store.getDedicatedImageTrackRow();
+      if (imageRow >= store.maxRows) {
+        store.maxRows = imageRow + 1;
+      }
+      // CRITICAL: Place new image AFTER the last image on the same track (sequential)
+      const lastImageEndTime = store.getLastImageEndTime(imageRow);
+      const startTime = lastImageEndTime; // Start after last image ends
       await store.addImageLocal({
         url: uploadedUrl,
         minUrl: uploadedUrl, // Use same URL for now
-        row: newRow,
-        startTime: 0,
+        row: imageRow,
+        startTime,
       });
-      toast.success(`Added ${file.name} to timeline`);
+      toast.success(`Added ${file.name} to timeline (after ${(lastImageEndTime / 1000).toFixed(1)}s)`);
     } else if (fileType === 'audio') {
       // Get audio duration
       const audio = new Audio();
-      const audioDuration = await new Promise((resolve) => {
+      const audioDuration = await new Promise(resolve => {
         audio.addEventListener('loadedmetadata', () => {
-          resolve(audio.duration * 1000); // Convert to milliseconds
+          resolve((audio.duration || 5) * 1000); // Convert to milliseconds
         });
         audio.addEventListener('error', () => {
           resolve(5000); // Default 5 seconds if can't get duration
@@ -1099,41 +1102,112 @@ const TimeLineControlPanel = ({
         audio.src = uploadedUrl;
       });
 
+      // Professional track management: Get dedicated audio track row
+      const audioRow = store.getDedicatedAudioTrackRow();
+      
+      // Ensure row exists
+      if (audioRow >= store.maxRows) {
+        store.maxRows = audioRow + 1;
+      }
+
+      // Get last audio end time for sequential placement
+      const lastAudioEndTime = store.getLastAudioEndTime();
+      const startTime = lastAudioEndTime; // Add at end of last audio
+
       store.addExistingAudio({
         base64Audio: uploadedUrl,
         durationMs: audioDuration,
-        row: newRow,
-        startTime: 0,
+        row: audioRow, // Dedicated audio track
+        startTime, // Sequential placement
         audioType: 'music',
         duration: audioDuration,
         id: Date.now() + Math.random().toString(36).substring(2, 9),
+        name: file.name,
       });
-      toast.success(`Added ${file.name} to timeline`);
+      toast.success(`Added ${file.name} to audio track`);
     } else if (fileType === 'video') {
-      // Get video duration
-      const video = document.createElement('video');
-      const videoDuration = await new Promise((resolve) => {
-        video.addEventListener('loadedmetadata', () => {
-          resolve(video.duration * 1000); // Convert to milliseconds
+      // Use shared video metadata utility for reliable audio detection
+      let durationMs;
+      let hasAudio = false;
+
+      try {
+        const meta = await getVideoMetadataFromUrl(uploadedUrl);
+        durationMs = meta?.durationMs || 10000;
+        hasAudio = !!meta?.hasAudio;
+        console.log(`[Upload Button] Video metadata for ${file.name}:`, {
+          durationMs,
+          hasAudio,
+          url: uploadedUrl.substring(0, 50) + '...'
         });
-        video.addEventListener('error', () => {
-          resolve(10000); // Default 10 seconds if can't get duration
-        });
-        video.src = uploadedUrl;
-      });
+      } catch (err) {
+        console.warn(`[Upload Button] Video metadata detection failed for ${file.name}:`, err);
+        durationMs = 10000;
+        hasAudio = false;
+      }
+
+      // Professional track management: Get dedicated video and audio track rows
+      const videoRow = store.getDedicatedVideoTrackRow();
+      let audioRow = store.getDedicatedAudioTrackRow();
+
+      // CRITICAL: Ensure audio row is ALWAYS different from video row
+      if (audioRow === videoRow && hasAudio) {
+        // Find next available row for audio
+        audioRow = Math.max(videoRow + 1, store.maxRows);
+      }
+
+      // Ensure rows exist for video and audio (separate tracks)
+      if (videoRow >= store.maxRows) {
+        store.maxRows = videoRow + 1;
+      }
+      if (hasAudio && audioRow >= store.maxRows) {
+        store.maxRows = audioRow + 1;
+      }
+
+      // Get last video end time for sequential placement (professional way)
+      const lastVideoEndTime = store.getLastVideoEndTime();
+      const startTime = lastVideoEndTime; // Add at end of last video
 
       await store.handleVideoUploadFromUrl({
         url: uploadedUrl,
         title: file.name,
         key: null,
-        duration: videoDuration,
-        row: newRow,
-        startTime: 0,
+        duration: durationMs,
+        row: videoRow,
+        startTime, // Explicit start time for alignment
         isNeedLoader: false,
+        hasSeparateAudio: hasAudio, // Pass flag to mute video if audio is extracted
       });
-      toast.success(`Added ${file.name} to timeline`);
+
+      // If video has an audio track, create a separate, aligned audio clip
+      // CRITICAL: Both must start at the same time and stay aligned
+      if (hasAudio) {
+        try {
+          await store.addExistingAudio({
+            base64Audio: uploadedUrl,
+            durationMs,
+            row: audioRow,
+            startTime, // Same start time as video for perfect alignment
+            audioType: 'music',
+            duration: durationMs, // Same duration as video
+            id: Date.now() + Math.random().toString(36).substring(2, 9),
+            name: file.name,
+          });
+          console.log(`[Upload Button] Successfully added audio track for ${file.name} on row ${audioRow}`);
+        } catch (audioError) {
+          console.error(`[Upload Button] Failed to add audio track for ${file.name}:`, audioError);
+          toast.error(`Video added but audio extraction failed for ${file.name}`);
+        }
+      } else {
+        console.log(`[Upload Button] Video ${file.name} has no audio track - skipping audio extraction`);
+      }
+
+      toast.success(
+        hasAudio
+          ? `Added video and audio from ${file.name} to timeline (aligned)`
+          : `Added video ${file.name} to timeline`
+      );
     }
-    
+
     // Refresh elements to ensure proper display
     store.refreshElements();
   };

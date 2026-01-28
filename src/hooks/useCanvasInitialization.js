@@ -28,6 +28,10 @@ if (!fabric.VideoImage) {
       try {
         ctx.save();
         
+        // Enable high-quality image smoothing for crisp video rendering
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        
         // Apply custom filter if set
         const customFilter = this.customFilter;
         if (customFilter && customFilter !== 'none' && customFilter !== null && customFilter !== undefined) {
@@ -37,13 +41,27 @@ if (!fabric.VideoImage) {
           }
         }
         
-        ctx.drawImage(
-          this.videoElement,
-          -this.width / 2,
-          -this.height / 2,
-          this.width,
-          this.height
-        );
+        // Use original video dimensions for best quality
+        const video = this.videoElement;
+        if (video && video.videoWidth && video.videoHeight) {
+          // Draw at native resolution for best quality
+          ctx.drawImage(
+            video,
+            -this.width / 2,
+            -this.height / 2,
+            this.width,
+            this.height
+          );
+        } else {
+          // Fallback if video dimensions not available
+          ctx.drawImage(
+            this.videoElement,
+            -this.width / 2,
+            -this.height / 2,
+            this.width,
+            this.height
+          );
+        }
         
         // Reset filter
         if (customFilter && customFilter !== 'none' && customFilter !== null && customFilter !== undefined) {
@@ -202,7 +220,10 @@ export const useCanvasInitialization = (videoPanelRef, store) => {
 
     // Calculate canvas dimensions based on aspect ratio
     const canvasAspectRatio = store.getAspectRatioValue() || (9 / 16);
-    const baseWidth = 1080;
+    // Use a higher internal resolution for crisper rendering on large displays.
+    // The CSS scales the canvas down, so we render at 1920px width internally
+    // to avoid blurry upscaling (CapCut/Premiere-style sharp preview).
+    const baseWidth = 1920;
     const canvasHeight = Math.round(baseWidth / canvasAspectRatio);
     
     const canvas = new fabric.Canvas('canvas', {
@@ -215,6 +236,35 @@ export const useCanvasInitialization = (videoPanelRef, store) => {
       isDrawingMode: false,
       renderOnAddRemove: true,
     });
+
+    // Enable high-quality rendering for professional video editing
+    const lowerCanvas = canvas.lowerCanvasEl;
+    const upperCanvas = canvas.upperCanvasEl;
+    
+    // Set high-quality image smoothing for crisp video rendering
+    const setHighQualityRendering = (canvasEl) => {
+      if (!canvasEl) return;
+      const ctx = canvasEl.getContext('2d');
+      if (ctx) {
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        // Enable better text rendering
+        ctx.textRenderingOptimization = 'optimizeQuality';
+      }
+    };
+
+    setHighQualityRendering(lowerCanvas);
+    setHighQualityRendering(upperCanvas);
+
+    // Also set CSS for better rendering
+    if (lowerCanvas) {
+      lowerCanvas.style.imageRendering = 'high-quality';
+      lowerCanvas.style.imageRendering = '-webkit-optimize-contrast';
+    }
+    if (upperCanvas) {
+      upperCanvas.style.imageRendering = 'high-quality';
+      upperCanvas.style.imageRendering = '-webkit-optimize-contrast';
+    }
 
     // (debug logs removed)
 

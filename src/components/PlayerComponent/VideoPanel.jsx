@@ -11,6 +11,7 @@ import { CanvasDropZone } from './CanvasDropZone';
 
 import { PlayerFullscreen } from 'components/PlayerComponent/PlayerFullscreen/PlayerFullscreen';
 import { ButtonWithIcon } from 'components/reusableComponents/ButtonWithIcon';
+import CanvasSizeControlPanel from './CanvasSizeControlPanel/CanvasSizeControlPanel';
 import { useDispatch, useSelector } from 'react-redux';
 import {
   selectActiveScene,
@@ -280,16 +281,21 @@ export const VideoPanel = observer(
               </div>
             )}
             {!store.canvas?.getActiveObject() && (
-              <ButtonWithIcon
-                icon="ExpandIcon"
-                color="white"
-                accentColor="white"
-                size="15"
-                classNameButton={styles.expandBtn}
-                onClick={handleFullscreenOpen}
-                onKeyDown={handleExpandKeyDown}
-                tabIndex={0}
-              />
+              <>
+                <div className={styles.canvasControls}>
+                  <CanvasSizeControlPanel />
+                </div>
+                <ButtonWithIcon
+                  icon="ExpandIcon"
+                  color="white"
+                  accentColor="white"
+                  size="15"
+                  classNameButton={styles.expandBtn}
+                  onClick={handleFullscreenOpen}
+                  onKeyDown={handleExpandKeyDown}
+                  tabIndex={0}
+                />
+              </>
             )}
 
             <AnimationSidebar

@@ -175,14 +175,19 @@ export const refreshElementsUtil = async store =>
                 store.canvas.add(imageObject);
               } else if (element.type === 'imageUrl' && element.properties.src) {
                 // Handle imageUrl case, only if it has a src (not a placeholder)
-    
+
                 const imagePromise = new Promise((resolve, reject) => {
-                  // Add cache busting to prevent tainted canvas
+                  // Add cache busting to prevent tainted canvas for network images.
+                  // For blob: URLs we must not append query params, or the blob will not be found.
+                  const src = element.properties.src;
                   const cacheBustUrl =
-                    element.properties.src +
-                    (element.properties.src.includes('?') ? '&' : '?') +
-                    '_cb=' +
-                    Date.now();
+                    src && src.startsWith('blob:')
+                      ? src
+                      : src +
+                        (src.includes('?') ? '&' : '?') +
+                        '_cb=' +
+                        Date.now();
+
                   fabric.Image.fromURL(
                     cacheBustUrl,
                     imageObjectDefault => {

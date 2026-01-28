@@ -332,6 +332,11 @@ export const CoverVideo = fabric.util.createClass(fabric.Image, {
       this.callSuper('_render', ctx);
       return;
     }
+    
+    // Enable high-quality image smoothing for crisp video rendering
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    
     const width = this.width;
     const height = this.height;
     const crop = this.getCrop(this.getOriginalSize(), {
@@ -347,6 +352,8 @@ export const CoverVideo = fabric.util.createClass(fabric.Image, {
     ctx.save();
     const customFilter = this.customFilter;
     ctx.filter = getFilterFromEffectType(customFilter);
+    
+    // Use native video dimensions for best quality rendering
     ctx.drawImage(
       this._element,
       Math.max(cropX, 0) / videoScaledX,

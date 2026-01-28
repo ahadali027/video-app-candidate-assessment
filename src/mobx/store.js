@@ -139,6 +139,7 @@ export class Store {
 
     // Aspect ratio state
     this.currentAspectRatio = { width: 9, height: 16 }; // Default to 9:16
+    this.aspectRatioAutoDetected = false; // Track if aspect ratio was auto-detected from media
 
     // Subtitles panel state
     this.subtitlesPanelState = observable({
@@ -734,6 +735,399 @@ export class Store {
       isDraggingRow: false, // indicates if dragging rows for reordering
       draggedRowIndex: null, // index of the row being dragged
       dragOverRowIndex: null, // index of the row being hovered over
+      // Animation drag (timeline element of type animation)
+      isAnimationDrag: false,
+    });
+
+    // Helper: fully reset all ghost-related state after any drag/drop operation
+    this.resetGhostState = action(() => {
+      const gs = this.ghostState;
+      gs.isDragging = false;
+      gs.ghostElement = null;
+      gs.ghostMarkerPosition = null;
+      gs.draggedElement = null;
+      gs.alignmentLines = [];
+      gs.isIncompatibleRow = false;
+      gs.initialClickOffset = 0;
+      gs.initialClientX = null;
+      gs.initialElementStart = 0;
+      gs.isResizing = false;
+      gs.resizeType = null;
+      gs.resizeGhostElement = null;
+      gs.isMultiDragging = false;
+      gs.multiGhostElements = [];
+      gs.selectedElements = [];
+      gs.initialElementStarts = [];
+      gs.livePushOffsets = new Map();
+      gs.isGalleryDragging = false;
+      gs.galleryGhostElement = null;
+      gs.galleryItemData = null;
+      gs.isFileDragging = false;
+      gs.fileGhostElement = null;
+      gs.fileData = null;
+      gs.isDraggingRow = false;
+      gs.draggedRowIndex = null;
+      gs.dragOverRowIndex = null;
+      gs.isAnimationDrag = false;
+    });
+
+    // Start a "file ghost" for native file drags over the timeline grid/rows
+    this.startFileGhostDrag = action((file, elementType, defaultDurationMs) => {
+      const gs = this.ghostState;
+      gs.isFileDragging = true;
+      gs.fileData = {
+        name: file?.name,
+        type: file?.type,
+      };
+      gs.fileGhostElement = {
+        left: 0,
+        width: defaultDurationMs || 5000,
+        row: 0,
+        elementType,
+        isIncompatible: false,
+      };
+    });
+
+    // Update the current file ghost position/row and compatibility flag
+    this.updateFileGhost = action((newStartTimeMs, targetRow, isIncompatible) => {
+      const gs = this.ghostState;
+      if (!gs.isFileDragging || !gs.fileGhostElement) return;
+      const duration = gs.fileGhostElement.width || 5000;
+      gs.fileGhostElement = {
+        ...gs.fileGhostElement,
+        left: newStartTimeMs,
+        width: duration,
+        row: targetRow,
+        isIncompatible: !!isIncompatible,
+      };
+    });
+
+    // Finish a file ghost drag and clear ghost state (actual file add is handled by callers)
+    this.finishFileGhostDrag = action(() => {
+      const gs = this.ghostState;
+      gs.isFileDragging = false;
+      gs.fileGhostElement = null;
+      gs.fileData = null;
+      gs.isIncompatibleRow = false;
+    });
+
+    // Basic move helper for inter-row drop zone: move an element to a new row/start time
+    // CRITICAL: Enforces strict type separation - video/audio/image never mix on same row
+    this.moveElementToInterRowDropZone = action(
+      (elementId, targetRow, startTimeMs) => {
+        const element = this.editorElements.find(el => el.id === elementId);
+        if (!element || !element.timeFrame) return;
+
+        // Check compatibility with existing elements in target row
+        const targetRowElements = this.editorElements.filter(el => el.row === targetRow && el.id !== elementId);
+        const elementType = element.type;
+        
+        // Helper to check if types are compatible (video/audio/image never mix)
+        const areTypesCompatible = (type1, type2) => {
+          if (type1 === 'text' || type2 === 'text') return type1 === 'text' && type2 === 'text';
+          if (type1 === 'animation' || type2 === 'animation') return true;
+          const videoTypes = ['video'];
+          const audioTypes = ['audio'];
+          const imageTypes = ['imageUrl', 'image'];
+          const v1 = videoTypes.includes(type1), v2 = videoTypes.includes(type2);
+          const a1 = audioTypes.includes(type1), a2 = audioTypes.includes(type2);
+          const i1 = imageTypes.includes(type1), i2 = imageTypes.includes(type2);
+          if (v1 && (a2 || i2)) return false;
+          if (v2 && (a1 || i1)) return false;
+          if (a1 && (v2 || i2)) return false;
+          if (a2 && (v1 || i1)) return false;
+          if (i1 && (v2 || a2)) return false;
+          if (i2 && (v1 || a1)) return false;
+          return i1 && i2;
+        };
+
+        // Check if element is compatible with all existing elements in target row
+        const isCompatible = targetRowElements.every(existingEl => 
+          areTypesCompatible(elementType, existingEl.type)
+        );
+
+        // If incompatible, reject the move (prevent audio/video/image mixing)
+        if (!isCompatible && targetRowElements.length > 0) {
+          console.warn(`Cannot move ${elementType} to row ${targetRow}: incompatible with existing ${targetRowElements[0].type} elements`);
+          return; // Reject move - keep element in original row
+        }
+
+        const duration = element.timeFrame.end - element.timeFrame.start;
+        const safeStart = Math.max(0, startTimeMs ?? element.timeFrame.start);
+        const safeEnd = safeStart + duration;
+
+        element.row = targetRow;
+        element.timeFrame = {
+          start: safeStart,
+          end: safeEnd,
+        };
+
+        this.maxRows = Math.max(this.maxRows, targetRow + 1);
+        this.refreshElements();
+      }
+    );
+
+    // Minimal implementation for startGhostDrag used by timeline-item and TimelineRow hover
+    this.startGhostDrag = action(
+      (element, initialClickOffset, /* rowOffset */ _rowOffset, mode) => {
+        const gs = this.ghostState;
+        gs.isDragging = true;
+        gs.draggedElement = element;
+        gs.initialClickOffset = initialClickOffset || 0;
+        gs.initialElementStart = element?.timeFrame?.start || 0;
+        gs.ghostElement = {
+          left: gs.initialElementStart,
+          width:
+            (element?.timeFrame?.end || gs.initialElementStart + 1000) -
+            gs.initialElementStart,
+          row: element?.row || 0,
+          elementType: element?.type || 'unknown',
+        };
+        gs.isIncompatibleRow = false;
+      }
+    );
+
+    // Update ghost element for normal (non-animation) elements with simple push logic
+    this.updateGhostElementWithPush = action(
+      (newStartTimeMs, rowIndex, isIncompatible, draggedElement) => {
+        const gs = this.ghostState;
+        const duration =
+          (draggedElement?.timeFrame?.end || 0) -
+            (draggedElement?.timeFrame?.start || 0) || 1000;
+        gs.ghostElement = {
+          left: newStartTimeMs,
+          width: duration,
+          row: rowIndex,
+          elementType: draggedElement?.type || 'unknown',
+          canPush: !isIncompatible,
+        };
+        gs.isIncompatibleRow = !!isIncompatible;
+
+        // Calculate alignment lines for snap guides
+        this.calculateSnapAlignmentLines(newStartTimeMs, duration, rowIndex, draggedElement);
+      }
+    );
+
+    // Calculate snap alignment lines when dragging clips near each other
+    this.calculateSnapAlignmentLines = action((newStartTimeMs, duration, rowIndex, draggedElement) => {
+      const gs = this.ghostState;
+      const alignmentLines = [];
+      const snapThresholdMs = 200; // 200ms threshold for snapping (time-based, more accurate)
+      const newEndTimeMs = newStartTimeMs + duration;
+
+      // Get all elements in the same row and other rows
+      const allElements = this.editorElements.filter(el => 
+        el.timeFrame && el.id !== draggedElement?.id
+      );
+
+      // Check for alignment with other clips' start/end positions
+      allElements.forEach(element => {
+        const elStart = element.timeFrame.start;
+        const elEnd = element.timeFrame.end;
+
+        // Calculate percentage positions for rendering
+        const timelineWidth = this.maxTime || 60000;
+        const startPos = (newStartTimeMs / timelineWidth) * 100;
+        const endPos = (newEndTimeMs / timelineWidth) * 100;
+        const elStartPos = (elStart / timelineWidth) * 100;
+        const elEndPos = (elEnd / timelineWidth) * 100;
+
+        // Check start-to-start alignment (time-based)
+        if (Math.abs(newStartTimeMs - elStart) < snapThresholdMs) {
+          alignmentLines.push({
+            position: elStartPos,
+            type: 'start-start',
+            snapGuide: true,
+            snapTime: elStart, // Store actual time for snapping
+          });
+        }
+
+        // Check start-to-end alignment
+        if (Math.abs(newStartTimeMs - elEnd) < snapThresholdMs) {
+          alignmentLines.push({
+            position: elEndPos,
+            type: 'start-end',
+            snapGuide: true,
+            snapTime: elEnd,
+          });
+        }
+
+        // Check end-to-start alignment
+        if (Math.abs(newEndTimeMs - elStart) < snapThresholdMs) {
+          alignmentLines.push({
+            position: elStartPos,
+            type: 'end-start',
+            snapGuide: true,
+            snapTime: elStart,
+          });
+        }
+
+        // Check end-to-end alignment
+        if (Math.abs(newEndTimeMs - elEnd) < snapThresholdMs) {
+          alignmentLines.push({
+            position: elEndPos,
+            type: 'end-end',
+            snapGuide: true,
+            snapTime: elEnd,
+          });
+        }
+      });
+
+      // Remove duplicates (same position)
+      const uniqueLines = [];
+      const seenPositions = new Set();
+      alignmentLines.forEach(line => {
+        const key = `${line.position.toFixed(2)}`;
+        if (!seenPositions.has(key)) {
+          seenPositions.add(key);
+          uniqueLines.push(line);
+        }
+      });
+
+      gs.alignmentLines = uniqueLines;
+    });
+
+    // Update ghost element specifically for animations
+    this.updateAnimationGhostElementWithPush = action(
+      (newStartTimeMs, rowIndex, isIncompatible, draggedElement) => {
+        // For now, reuse the same logic; could be extended with animation-specific behavior
+        this.updateGhostElementWithPush(
+          newStartTimeMs,
+          rowIndex,
+          isIncompatible,
+          draggedElement
+        );
+      }
+    );
+
+    // Start a resize ghost for timeline elements (used by DraggableElementView)
+    this.startResizeGhost = action(
+      (element, resizeType, initialClickOffset = 0) => {
+        const gs = this.ghostState;
+        gs.isResizing = true;
+        gs.resizeType = resizeType;
+        gs.initialClickOffset = initialClickOffset;
+        gs.resizeGhostElement = {
+          left: element.timeFrame.start,
+          width: element.timeFrame.end - element.timeFrame.start,
+          row: element.row || 0,
+          elementType: element.type || 'unknown',
+        };
+      }
+    );
+
+    // Update the resize ghost's start/end and derived left/width
+    this.updateResizeGhost = action((newStart, newEnd) => {
+      const gs = this.ghostState;
+      if (!gs.isResizing || !gs.resizeGhostElement) return;
+      const safeStart = Math.max(0, newStart);
+      const safeEnd = Math.max(safeStart + 100, newEnd);
+      gs.resizeGhostElement = {
+        ...gs.resizeGhostElement,
+        left: safeStart,
+        width: safeEnd - safeStart,
+      };
+    });
+
+    // Finish a resize operation and apply the new timeframe to the active element
+    this.finishResizeGhost = action((finalStart, finalEnd) => {
+      const gs = this.ghostState;
+      if (!gs.isResizing || !gs.resizeType) {
+        gs.isResizing = false;
+        gs.resizeType = null;
+        gs.resizeGhostElement = null;
+        return;
+      }
+
+      const element = this.selectedElement || gs.draggedElement;
+      if (element && element.timeFrame) {
+        const duration = Math.max(100, finalEnd - finalStart);
+        element.timeFrame = {
+          start: finalStart,
+          end: finalStart + duration,
+        };
+        this.refreshElements();
+      }
+
+      gs.isResizing = false;
+      gs.resizeType = null;
+      gs.resizeGhostElement = null;
+      gs.initialClickOffset = 0;
+    });
+
+    // Finish normal timeline-element ghost drag: move element to position/row and reset
+    this.finishGhostDrag = action((finalPosition, rowIndex) => {
+      const gs = this.ghostState;
+      const el = gs.draggedElement;
+      if (el && el.id != null) {
+        this.moveElementToInterRowDropZone(el.id, rowIndex, finalPosition);
+      }
+      this.resetGhostState();
+    });
+
+    // Finish animation-element ghost drag: same as finishGhostDrag
+    this.finishAnimationGhostDrag = action((finalPosition, rowIndex) => {
+      const gs = this.ghostState;
+      const el = gs.draggedElement;
+      if (el && el.id != null) {
+        this.moveElementToInterRowDropZone(el.id, rowIndex, finalPosition);
+      }
+      this.resetGhostState();
+    });
+
+    // Finish gallery ghost drag: run callback with (startTime, targetRow), then clear gallery ghost
+    this.finishGalleryGhostDrag = action(
+      (finalPosition, rowIndex, callback) => {
+        const gs = this.ghostState;
+        const startTime = Math.max(0, Math.min(this.maxTime, finalPosition));
+        const targetRow = Math.max(0, rowIndex ?? 0);
+        if (typeof callback === 'function') {
+          Promise.resolve(callback(startTime, targetRow)).catch(() => {});
+        }
+        gs.isGalleryDragging = false;
+        gs.galleryGhostElement = null;
+        gs.galleryItemData = null;
+      }
+    );
+
+    // Finish multi-selection ghost drag: apply delta to all selected elements, then reset
+    this.finishMultiGhostDrag = action((finalPosition, rowIndex) => {
+      const gs = this.ghostState;
+      const selected = gs.selectedElements || [];
+      const starts = gs.initialElementStarts || [];
+      const dragged = gs.draggedElement;
+      const primaryIndex =
+        dragged != null
+          ? selected.findIndex(el => el && el.id === dragged.id)
+          : 0;
+      if (primaryIndex >= 0 && starts[primaryIndex] != null) {
+        const delta = finalPosition - starts[primaryIndex];
+        const targetRow = Math.max(0, rowIndex ?? (dragged?.row ?? 0));
+        selected.forEach((el, i) => {
+          if (el && el.id != null && starts[i] != null) {
+            const newStart = Math.max(
+              0,
+              Math.min(this.maxTime, starts[i] + delta)
+            );
+            this.moveElementToInterRowDropZone(el.id, targetRow, newStart);
+          }
+        });
+      }
+      this.resetGhostState();
+    });
+
+    // Minimal history saver to prevent runtime errors from missing method
+    this.saveToHistory = action(() => {
+      // For the purposes of this challenge, keep this lightweight.
+      // A full implementation would snapshot editorElements/timeline state.
+      // Here we just track a shallow copy to enable basic undo hooks without crashing.
+      const snapshot = {
+        editorElements: this.editorElements.map(el => ({ ...el })),
+        maxTime: this.maxTime,
+        maxRows: this.maxRows,
+      };
+      this.history = [...this.history, snapshot].slice(-50);
+      this.currentHistoryIndex = this.history.length - 1;
     });
 
     makeAutoObservable(this, {
@@ -4159,6 +4553,163 @@ export class Store {
     ctx.drawImage(img, cx, cy, cw, ch, x, y, w, h);
   }
 
+  // Professional track management - get dedicated video track row
+  // CRITICAL: Video and audio MUST be on separate rows - never mix them
+  getDedicatedVideoTrackRow = () => {
+    // Find first row that contains ONLY videos (no audio, no images) or is empty
+    for (let row = 0; row < this.maxRows; row++) {
+      const rowElements = this.editorElements.filter(el => el.row === row);
+      if (rowElements.length === 0) {
+        return row; // Empty row - perfect for video
+      }
+      // STRICT: Row must contain ONLY videos - reject if any audio/image/text exists
+      const hasOnlyVideos = rowElements.every(
+        el => el.type === 'video' || el.type === 'animation' || el.type === 'transition'
+      );
+      const hasNoAudio = !rowElements.some(el => el.type === 'audio');
+      const hasNoImages = !rowElements.some(el => el.type === 'imageUrl' || el.type === 'image');
+      const hasNoText = !rowElements.some(el => el.type === 'text');
+      
+      if (hasOnlyVideos && hasNoAudio && hasNoImages && hasNoText) {
+        return row; // Video-only row - safe to use
+      }
+    }
+    // No dedicated video row found, create new one (guaranteed separate from audio)
+    return this.maxRows;
+  };
+
+  // Professional track management - get dedicated audio track row
+  // CRITICAL: Audio MUST be on separate row from video - never mix them
+  getDedicatedAudioTrackRow = () => {
+    // Find first row that contains ONLY audio (no video, no images) or is empty
+    for (let row = 0; row < this.maxRows; row++) {
+      const rowElements = this.editorElements.filter(el => el.row === row);
+      if (rowElements.length === 0) {
+        return row; // Empty row - perfect for audio
+      }
+      // STRICT: Row must contain ONLY audio - reject if any video/image exists
+      const hasOnlyAudio = rowElements.every(
+        el => el.type === 'audio' || el.type === 'animation' || el.type === 'transition'
+      );
+      const hasNoVideo = !rowElements.some(el => el.type === 'video');
+      const hasNoImages = !rowElements.some(el => el.type === 'imageUrl' || el.type === 'image');
+      const hasNoText = !rowElements.some(el => el.type === 'text');
+      
+      if (hasOnlyAudio && hasNoVideo && hasNoImages && hasNoText) {
+        return row; // Audio-only row - safe to use
+      }
+    }
+    // No dedicated audio row found, create new one (guaranteed separate from video)
+    // IMPORTANT: Ensure it's different from video row - always use next available row
+    const videoRow = this.getDedicatedVideoTrackRow();
+    // If video is on maxRows, audio goes to maxRows+1, otherwise find next available
+    if (videoRow >= this.maxRows) {
+      return this.maxRows + 1;
+    }
+    // Find next available row after video row
+    for (let row = videoRow + 1; row < this.maxRows + 10; row++) {
+      const rowElements = this.editorElements.filter(el => el.row === row);
+      if (rowElements.length === 0) {
+        return row;
+      }
+      const hasOnlyAudio = rowElements.every(
+        el => el.type === 'audio' || el.type === 'animation' || el.type === 'transition'
+      );
+      const hasNoVideo = !rowElements.some(el => el.type === 'video');
+      if (hasOnlyAudio && hasNoVideo) {
+        return row;
+      }
+    }
+    return this.maxRows + 1;
+  };
+
+  // Find the end time of the last video in timeline (for sequential placement)
+  getLastVideoEndTime = () => {
+    const videoElements = this.editorElements
+      .filter(el => el.type === 'video' && el.timeFrame)
+      .map(el => ({
+        end: el.timeFrame.end,
+        row: el.row || 0,
+      }));
+
+    if (videoElements.length === 0) {
+      return 0; // No videos yet, start at beginning
+    }
+
+    // Find the maximum end time across all video tracks
+    const maxEndTime = Math.max(...videoElements.map(v => v.end));
+    return maxEndTime;
+  };
+
+  // Find the end time of the last audio in timeline
+  getLastAudioEndTime = () => {
+    const audioElements = this.editorElements
+      .filter(el => el.type === 'audio' && el.timeFrame)
+      .map(el => ({
+        end: el.timeFrame.end,
+        row: el.row || 0,
+      }));
+
+    if (audioElements.length === 0) {
+      return 0; // No audio yet, start at beginning
+    }
+
+    // Find the maximum end time across all audio tracks
+    const maxEndTime = Math.max(...audioElements.map(a => a.end));
+    return maxEndTime;
+  };
+
+  // Professional track management - get dedicated image track row (no combine with video/audio)
+  getDedicatedImageTrackRow = () => {
+    const isImageType = el =>
+      el.type === 'imageUrl' || el.type === 'image';
+    for (let row = 0; row < this.maxRows; row++) {
+      const rowElements = this.editorElements.filter(el => el.row === row);
+      if (rowElements.length === 0) return row;
+      if (rowElements.every(isImageType)) return row;
+    }
+    return this.maxRows;
+  };
+
+  // Find the end time of the last image in timeline (for sequential placement on image track)
+  // CRITICAL: Returns the end time of the last image on the SAME track for sequential placement
+  getLastImageEndTime = (targetRow = null) => {
+    // If targetRow is specified, find last image end time on that specific row
+    if (targetRow !== null) {
+      const rowImageElements = this.editorElements
+        .filter(
+          el =>
+            (el.type === 'imageUrl' || el.type === 'image') &&
+            el.timeFrame &&
+            el.row === targetRow
+        )
+        .map(el => el.timeFrame.end);
+
+      if (rowImageElements.length === 0) {
+        return 0; // No images on this row yet, start at beginning
+      }
+
+      // Return the maximum end time on this specific row
+      return Math.max(...rowImageElements);
+    }
+
+    // If no targetRow specified, find maximum end time across all image tracks
+    const imageElements = this.editorElements
+      .filter(
+        el =>
+          (el.type === 'imageUrl' || el.type === 'image') && el.timeFrame
+      )
+      .map(el => ({ end: el.timeFrame.end }));
+
+    if (imageElements.length === 0) {
+      return 0; // No images yet, start at beginning
+    }
+
+    // Find the maximum end time across all image tracks
+    return Math.max(...imageElements.map(i => i.end));
+  };
+
+  // Professional video position finder - ensures no overlap on video tracks
   findBestVideoPosition(targetRow, videoDuration) {
     const rowElements = this.editorElements.filter(el => el.row === targetRow);
 
@@ -4459,6 +5010,10 @@ export class Store {
             ...this.editorElements.map(el => el.properties?.zIndex || 0),
             0
           );
+          // Preserve original video dimensions - CRITICAL for resolution
+          const originalVideoWidth = videoElement.videoWidth;
+          const originalVideoHeight = videoElement.videoHeight;
+
           // Add to editor elements with proper row placement
           this.addEditorElement({
             id: videoId,
@@ -4467,8 +5022,8 @@ export class Store {
             placement: {
               x: xPos,
               y: 0,
-              width: videoElement.videoWidth * scale,
-              height: videoElement.videoHeight * scale,
+              width: originalVideoWidth * scale,
+              height: originalVideoHeight * scale,
               rotation: 0,
               scaleX: scale,
               scaleY: scale,
@@ -4490,8 +5045,11 @@ export class Store {
               effect: {
                 type: 'none',
               },
-              width: videoElement.videoWidth,
-              height: videoElement.videoHeight,
+              // Preserve original video dimensions - CRITICAL for resolution
+              width: originalVideoWidth,
+              height: originalVideoHeight,
+              originalWidth: originalVideoWidth,
+              originalHeight: originalVideoHeight,
               isInTimeline: true,
               thumbnails,
               thumbnailDuration: videoDurationMs / thumbnails.length,
@@ -4552,7 +5110,7 @@ export class Store {
     });
   }
 
-  // Method to add a loading placeholder for video
+  // Method to add a loading placeholder for video with proper state management
   addVideoLoadingPlaceholder({ title, row = 0, estimatedDuration = 10000 }) {
     const placeholderId = `loading-video-${Math.random()
       .toString(36)
@@ -4566,6 +5124,8 @@ export class Store {
       name: title,
       type: 'video',
       isLoading: true,
+      loadingState: 'uploading', // 'uploading' | 'processing' | 'error'
+      errorMessage: null,
       timeFrame: {
         start: startPosition,
         end: startPosition + estimatedDuration,
@@ -4590,6 +5150,15 @@ export class Store {
 
     return placeholderId;
   }
+
+  // Update loading placeholder state
+  updateLoadingPlaceholderState = action((placeholderId, state, errorMessage = null) => {
+    const element = this.editorElements.find(el => el.id === placeholderId && el.isLoading);
+    if (element) {
+      element.loadingState = state;
+      element.errorMessage = errorMessage;
+    }
+  });
 
   // Method to replace loading placeholder with actual video
   replaceVideoPlaceholder(placeholderId, videoData) {
@@ -4647,6 +5216,7 @@ export class Store {
     row = 0,
     startTime = null, // New parameter for gallery ghost positioning
     isNeedLoader = true,
+    hasSeparateAudio = false, // Flag to indicate if audio will be extracted separately
   }) {
     let placeholderId = null;
     // Add loading placeholder immediately
@@ -4664,10 +5234,16 @@ export class Store {
       videoElement.playsInline = true;
       videoElement.muted = true;
       videoElement.crossOrigin = 'anonymous';
-      videoElement.src = `${url}?v=${Date.now()}`;
+      // For blob: URLs, do not append cache-busting parameters
+      videoElement.src =
+        url && url.startsWith('blob:')
+          ? url
+          : `${url}?v=${Date.now()}`;
       videoElement.style.display = 'none';
-      videoElement.muted = false;
-      videoElement.volume = 1.0;
+      // CRITICAL: Keep video muted if audio will be extracted separately
+      // This prevents double audio playback (video audio + separate audio track)
+      videoElement.muted = hasSeparateAudio ? true : false;
+      videoElement.volume = hasSeparateAudio ? 0 : 1.0;
       videoElement.controls = true;
       document.body.appendChild(videoElement);
 
@@ -4681,38 +5257,71 @@ export class Store {
 
         const generateThumbnails = async () => {
           const thumbnails = [];
-          const count = Math.max(3, Math.round(videoElement.duration));
+          // Calculate optimal thumbnail count based on video duration
+          // More thumbnails for longer videos, but cap at reasonable number
+          const videoDuration = videoElement.duration || 10;
           const timelineWidth =
             document.querySelector('.timelineGrid')?.offsetWidth || 800;
-          const thumbWidth = Math.floor(timelineWidth / count);
-          const timelineHeight =
-            document.querySelector('.timelineGrid')?.offsetHeight || 400;
-          const thumbHeight = Math.max(40, Math.floor(timelineHeight * 0.12));
+          
+          // Calculate thumbnail count: aim for ~1 thumbnail per 2-3 seconds
+          // But ensure minimum 4 thumbnails and maximum 20 for performance
+          const idealCount = Math.max(4, Math.min(20, Math.ceil(videoDuration / 2.5)));
+          const count = idealCount;
+          
+          // Use higher resolution for better quality (CapCut-like)
+          // Base thumbnail size on actual video dimensions, not timeline size
+          const videoAspectRatio = videoElement.videoWidth / videoElement.videoHeight;
+          const baseHeight = 120; // Higher base resolution for crisp thumbnails
+          const baseWidth = Math.round(baseHeight * videoAspectRatio);
+          
+          // Ensure minimum width for quality
+          const thumbWidth = Math.max(baseWidth, 80);
+          const thumbHeight = baseHeight;
+          
           const canvas = document.createElement('canvas');
           const ctx = canvas.getContext('2d');
           canvas.width = thumbWidth;
           canvas.height = thumbHeight;
+          
+          // Use high-quality rendering settings
+          ctx.imageSmoothingEnabled = true;
+          ctx.imageSmoothingQuality = 'high';
 
           for (let i = 0; i < count; i++) {
-            const time = (videoElement.duration * i) / (count - 3 || 3);
-            videoElement.currentTime = time;
+            const time = (videoDuration * i) / (count - 1 || 1);
+            videoElement.currentTime = Math.min(time, videoDuration - 0.1);
             await new Promise(res =>
               videoElement.addEventListener('seeked', res, { once: true })
             );
+            
+            // Draw video frame at higher quality
             ctx.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
-            thumbnails.push(canvas.toDataURL('image/jpeg', 0.7));
+            
+            // Use higher JPEG quality (0.9 instead of 0.7) for better visual quality
+            thumbnails.push(canvas.toDataURL('image/jpeg', 0.9));
           }
           return thumbnails;
         };
 
         const thumbnails = await generateThumbnails();
+        
+        // Preserve original video dimensions - CRITICAL for resolution
+        const originalVideoWidth = videoElement.videoWidth;
+        const originalVideoHeight = videoElement.videoHeight;
+        
+        // Auto-detect aspect ratio from first video if not already detected
+        if (!this.aspectRatioAutoDetected && originalVideoWidth && originalVideoHeight) {
+          this.autoDetectAspectRatioFromMedia(originalVideoWidth, originalVideoHeight);
+        }
+        
         const canvasWidth = this.canvas?.width || 1920;
         const canvasHeight = this.canvas?.height || 1080;
+        // Calculate scale to fit canvas while preserving aspect ratio
         const scale = Math.min(
-          canvasWidth / videoElement.videoWidth,
-          canvasHeight / videoElement.videoHeight
+          canvasWidth / originalVideoWidth,
+          canvasHeight / originalVideoHeight
         );
-        const xPos = (canvasWidth - videoElement.videoWidth * scale) / 2;
+        const xPos = (canvasWidth - originalVideoWidth * scale) / 2;
 
         // Find a suitable row for the video
         const existingElements = this.editorElements;
@@ -4900,15 +5509,22 @@ export class Store {
           // Force canvas to render and ensure video is visible
           this.canvas.requestRenderAll();
 
+          // Preserve original video dimensions - CRITICAL for resolution
+          const originalVideoWidth = videoElement.videoWidth;
+          const originalVideoHeight = videoElement.videoHeight;
+
           this.replaceVideoPlaceholder(placeholderId, {
             id: videoId,
             name: title,
             type: 'video',
+            isLoading: false, // Remove loading state
+            loadingState: null,
+            errorMessage: null,
             placement: {
               x: xPos,
               y: 0,
-              width: videoElement.videoWidth * scale,
-              height: videoElement.videoHeight * scale,
+              width: originalVideoWidth * scale,
+              height: originalVideoHeight * scale,
               rotation: 0,
               scaleX: scale,
               scaleY: scale,
@@ -4921,12 +5537,16 @@ export class Store {
               elementId: `video-${videoId}`,
               src: url,
               effect: { type: 'none' },
-              width: videoElement.videoWidth,
-              height: videoElement.videoHeight,
+              // Preserve original video dimensions - CRITICAL for resolution
+              width: originalVideoWidth,
+              height: originalVideoHeight,
+              originalWidth: originalVideoWidth,
+              originalHeight: originalVideoHeight,
               isInTimeline: true,
               thumbnails,
               thumbnailDuration: videoDurationMs / thumbnails.length,
               duration: videoDurationMs,
+              hasSeparateAudio: hasSeparateAudio, // Track if audio is extracted separately
             },
             fabricObject: fabricVideo,
             row: targetRow,
@@ -4975,16 +5595,24 @@ export class Store {
               // Update video element ID to match new videoId
               videoElement.id = `video-${videoId}`;
 
+              // Preserve original video dimensions - CRITICAL for resolution
+              const originalVideoWidth = videoElement.videoWidth;
+              const originalVideoHeight = videoElement.videoHeight;
+
               // Update the element in place using runInAction for MobX
               runInAction(() => {
                 const startPosition =
                   startTime !== null
                     ? startTime
                     : this.findBestVideoPosition(targetRow, videoDurationMs);
+                
                 this.editorElements[elementIndex] = {
                   ...tempElement,
                   name: title,
                   type: 'video',
+                  isLoading: false, // Remove loading state
+                  loadingState: null,
+                  errorMessage: null,
                   timeFrame: {
                     start: startPosition,
                     end: startPosition + videoDurationMs,
@@ -4993,10 +5621,16 @@ export class Store {
                     ...tempElement.properties,
                     elementId: `video-${videoId}`,
                     src: url,
+                    // Preserve original video dimensions - CRITICAL for resolution
+                    width: originalVideoWidth,
+                    height: originalVideoHeight,
+                    originalWidth: originalVideoWidth,
+                    originalHeight: originalVideoHeight,
                     thumbnails,
                     thumbnailDuration: videoDurationMs / thumbnails.length,
                     duration: videoDurationMs,
                     isInTimeline: true,
+                    hasSeparateAudio: hasSeparateAudio, // Track if audio is extracted separately
                   },
                   fabricObject: fabricVideo,
                 };
@@ -5011,16 +5645,27 @@ export class Store {
               }
             }
           } else {
+            // Preserve original video dimensions - CRITICAL for resolution
+            const originalVideoWidth = videoElement.videoWidth;
+            const originalVideoHeight = videoElement.videoHeight;
+            const maxZIndex = Math.max(
+              ...this.editorElements.map(el => el.properties?.zIndex || 0),
+              0
+            );
+
             // Create new element if no temporary element exists
             this.addEditorElement({
               id: videoId,
               name: title,
               type: 'video',
+              isLoading: false, // Ensure loading state is cleared
+              loadingState: null,
+              errorMessage: null,
               placement: {
                 x: xPos,
                 y: 0,
-                width: videoElement.videoWidth * scale,
-                height: videoElement.videoHeight * scale,
+                width: originalVideoWidth * scale,
+                height: originalVideoHeight * scale,
                 rotation: 0,
                 scaleX: scale,
                 scaleY: scale,
@@ -5039,13 +5684,21 @@ export class Store {
               properties: {
                 elementId: `video-${videoId}`,
                 src: url,
-                effect: { type: 'none' },
-                width: videoElement.videoWidth,
-                height: videoElement.videoHeight,
+                effect: {
+                  type: 'none',
+                },
+                // Preserve original video dimensions - CRITICAL for resolution
+                width: originalVideoWidth,
+                height: originalVideoHeight,
+                originalWidth: originalVideoWidth,
+                originalHeight: originalVideoHeight,
                 isInTimeline: true,
                 thumbnails,
                 thumbnailDuration: videoDurationMs / thumbnails.length,
                 duration: videoDurationMs,
+                zIndex: maxZIndex + 1,
+                isActive: true,
+                hasSeparateAudio: hasSeparateAudio, // Track if audio is extracted separately
               },
               fabricObject: fabricVideo,
             });
@@ -5072,16 +5725,20 @@ export class Store {
       videoElement.onerror = e => {
         console.error('Error loading video:', e);
 
-        // Remove the loading placeholder on error
+        // Update placeholder to error state
         if (placeholderId) {
-          const placeholderIndex = this.editorElements.findIndex(
-            el => el.id === placeholderId && el.isLoading
-          );
-          if (placeholderIndex !== -1) {
-            runInAction(() => {
-              this.editorElements.splice(placeholderIndex, 1);
-            });
-          }
+          this.updateLoadingPlaceholderState(placeholderId, 'error', 'Failed to load video from URL');
+          // Remove placeholder after showing error
+          setTimeout(() => {
+            const placeholderIndex = this.editorElements.findIndex(
+              el => el.id === placeholderId && el.isLoading
+            );
+            if (placeholderIndex !== -1) {
+              runInAction(() => {
+                this.editorElements.splice(placeholderIndex, 1);
+              });
+            }
+          }, 3000);
         }
 
         reject(new Error('Failed to load video from URL'));
@@ -5183,9 +5840,12 @@ export class Store {
     return new Promise((resolve, reject) => {
       const imageElement = new Image();
       imageElement.crossOrigin = 'Anonymous';
-      // Add cache busting parameter to force fresh CORS load
+      // For blob: URLs, we must not append cache-busting parameters,
+      // otherwise the browser treats it as a different, non-existing blob.
       const cacheBustUrl =
-        url + (url.includes('?') ? '&' : '?') + '_cb=' + Date.now();
+        url && url.startsWith('blob:')
+          ? url
+          : url + (url.includes('?') ? '&' : '?') + '_cb=' + Date.now();
       imageElement.src = cacheBustUrl;
 
       imageElement.onload = () => {
@@ -5203,6 +5863,11 @@ export class Store {
 
               const regularLeft = (canvasWidth - img.width * scale) / 2;
               const regularTop = (maxCanvasHeight - img.height * scale) / 2;
+
+              // Auto-detect aspect ratio from first image if not already detected
+              if (!this.aspectRatioAutoDetected && img.width && img.height) {
+                this.autoDetectAspectRatioFromMedia(img.width, img.height);
+              }
 
               const id = getUid();
               const newElement = {
@@ -5344,9 +6009,11 @@ export class Store {
     return new Promise((resolve, reject) => {
       const imageElement = new Image();
       imageElement.crossOrigin = 'Anonymous';
-      // Add cache busting parameter to force fresh CORS load
+      // For blob: URLs, do not append cache-busting parameters
       const cacheBustUrl =
-        url + (url.includes('?') ? '&' : '?') + '_cb=' + Date.now();
+        url && url.startsWith('blob:')
+          ? url
+          : url + (url.includes('?') ? '&' : '?') + '_cb=' + Date.now();
       imageElement.src = cacheBustUrl;
 
       imageElement.onload = () => {
@@ -5456,9 +6123,11 @@ export class Store {
     return new Promise((resolve, reject) => {
       const imageElement = new Image();
       imageElement.crossOrigin = 'Anonymous';
-      // Add cache busting parameter to force fresh CORS load
+      // For blob: URLs, do not append cache-busting parameters
       const cacheBustUrl =
-        url + (url.includes('?') ? '&' : '?') + '_cb=' + Date.now();
+        url && url.startsWith('blob:')
+          ? url
+          : url + (url.includes('?') ? '&' : '?') + '_cb=' + Date.now();
       imageElement.src = cacheBustUrl;
 
       imageElement.onload = () => {
@@ -9179,6 +9848,13 @@ export class Store {
       const video = document.getElementById(element.properties.elementId);
       if (!isHtmlVideoElement(video)) return;
 
+      // CRITICAL: If video has separate audio track, keep video muted
+      // This prevents double audio playback (video audio + separate audio track)
+      if (element.properties?.hasSeparateAudio) {
+        video.muted = true;
+        video.volume = 0;
+      }
+
       // Ensure video has correct playback rate
       if (video.playbackRate !== this.playbackRate) {
         video.playbackRate = this.playbackRate;
@@ -9321,11 +9997,19 @@ export class Store {
               const playPromise = audioElement.play();
               if (playPromise !== undefined) {
                 playPromise.catch(e => {
-                  console.error('Error playing audio:', e);
+                  // AbortError is expected when play() is interrupted by pause()
+                  // This happens frequently during scrubbing/seek and is not a real error.
+                  if (e && e.name === 'AbortError') {
+                    return;
+                  }
+                  console.warn('Error playing audio:', e);
                 });
               }
             } catch (error) {
-              console.error('Error playing audio:', error);
+              // Ignore AbortError caused by rapid play/pause; log others as warnings
+              if (!error || error.name !== 'AbortError') {
+                console.warn('Error playing audio:', error);
+              }
             }
           }
         } else {
@@ -10209,6 +10893,424 @@ export class Store {
       this.updateEditorElement(updatedElement);
     }
   }
+
+  /**
+   * Split an audio timeline element into two clips at the given time.
+   * COMPLETELY REBUILT FROM SCRATCH - Following exact same flow as addExistingAudio.
+   */
+  splitAudioElement = action((editorElement, splitPointMs) => {
+    console.log('🔵 splitAudioElement CALLED:', { 
+      elementId: editorElement?.id, 
+      type: editorElement?.type, 
+      splitPoint: splitPointMs,
+      timeFrame: editorElement?.timeFrame 
+    });
+
+    if (!editorElement || editorElement.type !== 'audio' || !editorElement.timeFrame) {
+      console.warn('❌ splitAudioElement: Invalid element', editorElement);
+      return;
+    }
+
+    const { start, end } = editorElement.timeFrame;
+    const MIN_DURATION = 1;
+
+    if (splitPointMs <= start + MIN_DURATION || splitPointMs >= end - MIN_DURATION) {
+      console.warn('❌ splitAudioElement: Split point too close to edge', { splitPointMs, start, end, MIN_DURATION });
+      return;
+    }
+
+    const index = this.editorElements.findIndex(el => el.id === editorElement.id);
+    if (index === -1) {
+      console.warn('❌ splitAudioElement: Element not found in editorElements', editorElement.id);
+      return;
+    }
+
+    console.log('✅ splitAudioElement: Proceeding with split', { index, start, end, splitPointMs });
+
+    const baseOffset = editorElement.properties?.audioOffset || 0;
+    const firstDuration = splitPointMs - start;
+    const secondDuration = end - splitPointMs;
+    const audioSrc = editorElement.properties?.src || '';
+    const newElementId = `audio-${getUid()}`;
+    const newElementUid = getUid();
+
+    console.log('✅ splitAudioElement: Creating elements', { newElementId, newElementUid, audioSrc });
+
+    // STEP 1: Update first element (trimmed timeframe, same elementId)
+    const firstElement = {
+      ...editorElement,
+      timeFrame: {
+        start,
+        end: splitPointMs,
+      },
+      properties: {
+        ...editorElement.properties,
+        audioOffset: baseOffset,
+      },
+      row: editorElement.row,
+    };
+
+    // STEP 2: Create second element - EXACT same structure as addExistingAudio creates
+    const secondElement = {
+      id: newElementUid,
+      name: editorElement.name || 'Split Audio',
+      type: 'audio',
+      placement: {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 100,
+        rotation: 0,
+        scaleX: 1,
+        scaleY: 1,
+      },
+      row: editorElement.row,
+      from: 1,
+      content: editorElement.content || 'Upbeat Corporate',
+      left: 0,
+      top: 0,
+      isDragging: false,
+      duration: secondDuration,
+      timeFrame: {
+        start: splitPointMs,
+        end,
+      },
+      properties: {
+        elementId: newElementId,
+        src: audioSrc,
+        audioOffset: baseOffset + firstDuration,
+        audioType: editorElement.properties?.audioType || 'music',
+        autoSubtitles: editorElement.properties?.autoSubtitles || false,
+        text: editorElement.properties?.text,
+      },
+    };
+
+    // STEP 3: Update editor elements array
+    const newEditorElements = [...this.editorElements];
+    newEditorElements[index] = firstElement;
+    newEditorElements.splice(index + 1, 0, secondElement);
+    
+    console.log('✅ splitAudioElement: Updating editorElements', { 
+      beforeCount: this.editorElements.length, 
+      afterCount: newEditorElements.length 
+    });
+    
+    this.setEditorElements(newEditorElements);
+
+    // STEP 4: Create HTML audio element immediately (same as addExistingAudio)
+    if (!document.getElementById(newElementId)) {
+      const audioElement = document.createElement('audio');
+      audioElement.id = newElementId;
+      audioElement.src = audioSrc;
+      audioElement.crossOrigin = 'anonymous';
+      audioElement.preload = 'auto';
+      audioElement.style.display = 'none';
+      document.body.appendChild(audioElement);
+      console.log('✅ splitAudioElement: Created HTML audio element', newElementId);
+    }
+
+    // STEP 5: Refresh elements (same as addExistingAudio)
+    console.log('✅ splitAudioElement: Refreshing elements');
+    this.refreshElements();
+    
+    if (!this.isUndoRedoOperation) {
+      this.saveToHistory();
+    }
+
+    console.log('✅ splitAudioElement: COMPLETED SUCCESSFULLY');
+  });
+
+  /**
+   * Split a video timeline element into two clips at the given time.
+   * COMPLETELY REBUILT FROM SCRATCH - Following exact same flow as addExistingVideo.
+   */
+  splitVideoElement = action((editorElement, splitPointMs) => {
+    console.log('🟢 splitVideoElement CALLED:', { 
+      elementId: editorElement?.id, 
+      type: editorElement?.type, 
+      splitPoint: splitPointMs,
+      timeFrame: editorElement?.timeFrame 
+    });
+
+    if (!editorElement || editorElement.type !== 'video' || !editorElement.timeFrame) {
+      console.warn('❌ splitVideoElement: Invalid element', editorElement);
+      return;
+    }
+
+    const { start, end } = editorElement.timeFrame;
+    const MIN_DURATION = 1;
+
+    if (splitPointMs <= start + MIN_DURATION || splitPointMs >= end - MIN_DURATION) {
+      console.warn('❌ splitVideoElement: Split point too close to edge', { splitPointMs, start, end, MIN_DURATION });
+      return;
+    }
+
+    const index = this.editorElements.findIndex(el => el.id === editorElement.id);
+    if (index === -1) {
+      console.warn('❌ splitVideoElement: Element not found in editorElements', editorElement.id);
+      return;
+    }
+
+    console.log('✅ splitVideoElement: Proceeding with split', { index, start, end, splitPointMs });
+
+    const baseOffset = editorElement.properties?.videoOffset || 0;
+    const firstDuration = splitPointMs - start;
+    const secondDuration = end - splitPointMs;
+    const videoSrc = editorElement.properties?.src || '';
+    const newElementId = `video-${getUid()}`;
+    const newElementUid = getUid();
+
+    console.log('✅ splitVideoElement: Creating elements', { 
+      newElementId, 
+      newElementUid, 
+      videoSrc,
+      baseOffset,
+      firstDuration,
+      secondDuration
+    });
+
+    // STEP 1: Update first element (trimmed timeframe, keeps same elementId)
+    const firstElement = {
+      ...editorElement,
+      timeFrame: {
+        start,
+        end: splitPointMs,
+      },
+      properties: {
+        ...editorElement.properties,
+        videoOffset: baseOffset,
+      },
+      row: editorElement.row,
+    };
+
+    // STEP 2: Calculate video offset for second clip
+    const originalVideo = this.videos?.find(v => v.id === editorElement.id);
+    let videoOffset = baseOffset + firstDuration;
+    if (originalVideo && typeof originalVideo.duration === 'number') {
+      const maxOffset = Math.max(0, originalVideo.duration - secondDuration);
+      videoOffset = Math.min(videoOffset, maxOffset);
+    }
+
+    // STEP 3: Create HTML video element (EXACT same as addExistingVideo)
+    const videoElement = document.createElement('video');
+    videoElement.preload = 'auto';
+    videoElement.playsInline = true;
+    videoElement.muted = editorElement.properties?.hasSeparateAudio ? true : true;
+    videoElement.crossOrigin = 'anonymous';
+    videoElement.src = videoSrc;
+    videoElement.style.display = 'none';
+    videoElement.controls = true;
+    videoElement.id = newElementId;
+    document.body.appendChild(videoElement);
+    console.log('✅ splitVideoElement: Created HTML video element', newElementId);
+
+    // STEP 4: Get placement from original element
+    const placement = editorElement.placement || {
+      x: 0,
+      y: 0,
+      width: 1920,
+      height: 1080,
+      rotation: 0,
+      scaleX: 1,
+      scaleY: 1,
+    };
+
+    // STEP 5: Create second element structure (EXACT same as addExistingVideo creates)
+    const secondElement = {
+      id: newElementUid,
+      name: editorElement.name || 'Split Video',
+      type: 'video',
+      placement: { ...placement },
+      timeFrame: {
+        start: splitPointMs,
+        end,
+      },
+      properties: {
+        elementId: newElementId,
+        src: videoSrc,
+        videoOffset: videoOffset,
+        effect: editorElement.properties?.effect || { type: 'none' },
+        width: placement.width,
+        height: placement.height,
+        isInTimeline: true,
+        thumbnails: editorElement.properties?.thumbnails || [],
+        thumbnailDuration: editorElement.properties?.thumbnailDuration || 
+          (secondDuration / (editorElement.properties?.thumbnails?.length || 1)),
+        duration: secondDuration,
+        hasSeparateAudio: editorElement.properties?.hasSeparateAudio || false,
+      },
+      row: editorElement.row,
+      from: 0,
+      isDragging: false,
+    };
+
+    // STEP 6: Update editor elements array immediately
+    const newEditorElements = [...this.editorElements];
+    newEditorElements[index] = firstElement;
+    newEditorElements.splice(index + 1, 0, secondElement);
+    
+    console.log('✅ splitVideoElement: Updating editorElements', { 
+      beforeCount: this.editorElements.length, 
+      afterCount: newEditorElements.length 
+    });
+    
+    this.setEditorElements(newEditorElements);
+
+    // STEP 7: Handle video loading (EXACT same flow as addExistingVideo.onloadedmetadata)
+    videoElement.onloadedmetadata = () => {
+      console.log('✅ splitVideoElement: Video metadata loaded', { newElementUid, duration: videoElement.duration });
+      runInAction(() => {
+        try {
+          // Add video to videos array (EXACT same as addExistingVideo)
+          if (this.videos && !this.videos.find(v => v.id === newElementUid)) {
+            this.videos.push({
+              element: videoElement,
+              id: newElementUid,
+              url: videoSrc,
+              name: editorElement.name || 'Split Video',
+              duration: videoElement.duration || secondDuration,
+              thumbnails: editorElement.properties?.thumbnails || [],
+            });
+            console.log('✅ splitVideoElement: Added to videos array');
+          }
+
+          // Update placement with actual video dimensions
+          const actualPlacement = {
+            x: placement.x,
+            y: placement.y,
+            width: videoElement.videoWidth || placement.width,
+            height: videoElement.videoHeight || placement.height,
+            rotation: placement.rotation,
+            scaleX: placement.scaleX,
+            scaleY: placement.scaleY,
+          };
+
+          // Create fabric video object (EXACT same as addExistingVideo)
+          const fabricVideo = new fabric.VideoImage(videoElement, {
+            left: actualPlacement.x,
+            top: actualPlacement.y,
+            width: actualPlacement.width,
+            height: actualPlacement.height,
+            scaleX: actualPlacement.scaleX,
+            scaleY: actualPlacement.scaleY,
+            angle: actualPlacement.rotation,
+            selectable: true,
+            objectCaching: false,
+            lockUniScaling: false,
+            hasControls: true,
+            hasBorders: true,
+            type: 'video',
+          });
+
+          // Update second element with fabric object and actual placement
+          const elementIndex = this.editorElements.findIndex(el => el.id === newElementUid);
+          if (elementIndex !== -1) {
+            this.editorElements[elementIndex].fabricObject = fabricVideo;
+            this.editorElements[elementIndex].placement = actualPlacement;
+            this.editorElements[elementIndex].properties.width = actualPlacement.width;
+            this.editorElements[elementIndex].properties.height = actualPlacement.height;
+            console.log('✅ splitVideoElement: Updated element with fabric object');
+          }
+
+          // Add to canvas (EXACT same as addExistingVideo)
+          if (this.canvas) {
+            this.canvas.add(fabricVideo);
+            this.canvas.requestRenderAll();
+            console.log('✅ splitVideoElement: Added fabric video to canvas');
+          }
+
+          // Refresh elements (EXACT same as addExistingVideo)
+          this.refreshElements();
+          console.log('✅ splitVideoElement: Refreshed elements');
+        } catch (error) {
+          console.error('❌ Error in splitVideoElement onloadedmetadata:', error);
+        }
+      });
+    };
+
+    // Fallback: ensure video is added even if metadata doesn't load
+    setTimeout(() => {
+      runInAction(() => {
+        if (this.videos && !this.videos.find(v => v.id === newElementUid)) {
+          this.videos.push({
+            element: videoElement,
+            id: newElementUid,
+            url: videoSrc,
+            name: editorElement.name || 'Split Video',
+            duration: videoElement.duration || secondDuration,
+            thumbnails: editorElement.properties?.thumbnails || [],
+          });
+          console.log('✅ splitVideoElement: Fallback - Added to videos array');
+        }
+        this.refreshElements();
+        console.log('✅ splitVideoElement: Fallback - Refreshed elements');
+      });
+    }, 1000);
+
+    if (!this.isUndoRedoOperation) {
+      this.saveToHistory();
+    }
+
+    console.log('✅ splitVideoElement: COMPLETED SUCCESSFULLY');
+  });
+
+  /**
+   * Split an image or imageUrl timeline element into two clips at the given time.
+   * COMPLETELY REBUILT FROM SCRATCH - Following exact same flow as image creation.
+   */
+  splitImageElement = action((editorElement, splitPointMs) => {
+    if (
+      !editorElement ||
+      (editorElement.type !== 'image' && editorElement.type !== 'imageUrl') ||
+      !editorElement.timeFrame
+    ) {
+      return;
+    }
+
+    const { start, end } = editorElement.timeFrame;
+    const MIN_DURATION = 1;
+
+    if (splitPointMs <= start + MIN_DURATION || splitPointMs >= end - MIN_DURATION) {
+      return;
+    }
+
+    const index = this.editorElements.findIndex(el => el.id === editorElement.id);
+    if (index === -1) {
+      return;
+    }
+
+    // STEP 1: Update first element (trimmed timeframe, keeps all properties)
+    const firstElement = {
+      ...editorElement,
+      timeFrame: {
+        start,
+        end: splitPointMs,
+      },
+    };
+
+    // STEP 2: Create second element (EXACT same structure as original)
+    const secondElement = {
+      ...editorElement,
+      id: getUid(),
+      timeFrame: {
+        start: splitPointMs,
+        end,
+      },
+    };
+
+    // STEP 3: Update editor elements array
+    const newEditorElements = [...this.editorElements];
+    newEditorElements[index] = firstElement;
+    newEditorElements.splice(index + 1, 0, secondElement);
+    this.setEditorElements(newEditorElements);
+
+    // STEP 4: Refresh elements (same as image creation flow)
+    this.refreshElements();
+
+    if (!this.isUndoRedoOperation) {
+      this.saveToHistory();
+    }
+  });
 
   trimAudioElement(editorElement, timeFrame) {
     // Start move if not already started
@@ -13454,6 +14556,56 @@ export class Store {
     return this.currentAspectRatio.width / this.currentAspectRatio.height;
   }
 
+  // Auto-detect and set aspect ratio from media dimensions (only if not already set)
+  autoDetectAspectRatioFromMedia = action((width, height) => {
+    if (!width || !height || this.aspectRatioAutoDetected) return;
+
+    // Calculate aspect ratio from media dimensions
+    const gcd = (a, b) => (b === 0 ? a : gcd(b, a % b));
+    const divisor = gcd(width, height);
+    const aspectWidth = width / divisor;
+    const aspectHeight = height / divisor;
+
+    // Common aspect ratios to snap to
+    const commonRatios = [
+      { w: 16, h: 9 },
+      { w: 9, h: 16 },
+      { w: 4, h: 3 },
+      { w: 3, h: 4 },
+      { w: 21, h: 9 },
+      { w: 1, h: 1 },
+    ];
+
+    // Find closest common ratio
+    let closestRatio = commonRatios[0];
+    let minDiff = Infinity;
+
+    for (const ratio of commonRatios) {
+      const diff = Math.abs(
+        aspectWidth / aspectHeight - ratio.w / ratio.h
+      );
+      if (diff < minDiff) {
+        minDiff = diff;
+        closestRatio = ratio;
+      }
+    }
+
+    // Only update if significantly different from current
+    const currentRatio = this.currentAspectRatio.width / this.currentAspectRatio.height;
+    const newRatio = closestRatio.w / closestRatio.h;
+    if (Math.abs(currentRatio - newRatio) > 0.01) {
+      this.currentAspectRatio = { width: closestRatio.w, height: closestRatio.h };
+      this.aspectRatioAutoDetected = true;
+
+      // Trigger canvas resize
+      if (typeof window !== 'undefined' && window.updateCanvasSize) {
+        requestAnimationFrame(() => {
+          window.updateCanvasSize();
+        });
+      }
+    }
+  });
+
   // Scale element positions when aspect ratio changes
   scaleElementPositions(scaleFactorX, scaleFactorY) {
     if (!this.canvas) return;
@@ -13658,14 +14810,23 @@ export class Store {
 
     // Shift elements to the left by gap duration
     elementsToShift.forEach(element => {
-      this.moveEditorElementTimeFrame(
-        element,
-        {
-          start: element.timeFrame.start - gapDuration,
-          end: element.timeFrame.end - gapDuration,
-        },
-        true
-      );
+      const newTimeFrame = {
+        start: Math.max(0, element.timeFrame.start - gapDuration),
+        end: Math.max(0, element.timeFrame.end - gapDuration),
+      };
+
+      // Use existing move helper if available, otherwise apply a safe inline update
+      if (typeof this.moveEditorElementTimeFrame === 'function') {
+        this.moveEditorElementTimeFrame(element, newTimeFrame, true);
+      } else {
+        const idx = this.editorElements.findIndex(el => el.id === element.id);
+        if (idx !== -1) {
+          this.editorElements[idx] = {
+            ...this.editorElements[idx],
+            timeFrame: newTimeFrame,
+          };
+        }
+      }
     });
 
     // Save state
@@ -13685,6 +14846,73 @@ export class Store {
   recalculateMaxRows = action(() => {
     // Use existing optimized cleanup method which also handles maxRows
     this.optimizedCleanupEmptyRows();
+  });
+
+  /**
+   * Multi‑selection ghost drag helpers (used by TimelineRow).
+   * Lightweight shims so TimelineRow's hover handler can call
+   * into the ghost system without runtime errors.
+   */
+  startMultiGhostDrag = action(
+    (selectedElements, primaryElement, initialClickOffset = 0) => {
+      const gs = this.ghostState;
+      if (!Array.isArray(selectedElements) || !primaryElement) return;
+
+      gs.isMultiDragging = true;
+      gs.selectedElements = selectedElements.slice();
+      gs.draggedElement = primaryElement;
+      gs.initialClickOffset = initialClickOffset || 0;
+      gs.initialClientX = null;
+      gs.initialElementStarts = selectedElements.map(
+        el => el?.timeFrame?.start || 0
+      );
+
+      // Seed multiGhostElements with simple copies for visual feedback
+      gs.multiGhostElements = selectedElements
+        .filter(Boolean)
+        .map(el => ({
+          id: el.id,
+          row: el.row || primaryElement.row || 0,
+          left: el.timeFrame?.start || 0,
+          width:
+            (el.timeFrame?.end || 0) -
+              (el.timeFrame?.start || 0) || 0,
+          elementType: el.type || 'unknown',
+        }));
+    }
+  );
+
+  updateMultiGhostElements = action(newPrimaryStart => {
+    const gs = this.ghostState;
+    if (!gs.isMultiDragging || !gs.selectedElements?.length) return;
+
+    const primary = gs.draggedElement || gs.selectedElements[0];
+    const primaryIndex = gs.selectedElements.findIndex(
+      el => el && el.id === primary.id
+    );
+    const primaryInitialStart =
+      gs.initialElementStarts?.[primaryIndex] ?? primary?.timeFrame?.start ?? 0;
+
+    const delta =
+      (newPrimaryStart ?? primaryInitialStart) - primaryInitialStart;
+
+    gs.multiGhostElements = gs.selectedElements
+      .map((el, i) => {
+        if (!el) return null;
+        const baseStart =
+          gs.initialElementStarts?.[i] ?? el.timeFrame?.start ?? 0;
+        const start = Math.max(0, baseStart + delta);
+        const duration =
+          (el.timeFrame?.end || 0) - (el.timeFrame?.start || 0) || 0;
+        return {
+          id: el.id,
+          row: el.row || primary.row || 0,
+          left: start,
+          width: duration,
+          elementType: el.type || 'unknown',
+        };
+      })
+      .filter(Boolean);
   });
 
   // Row reordering methods

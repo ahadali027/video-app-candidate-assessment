@@ -11,11 +11,12 @@ const AlignmentLines = observer(({ alignmentLines }) => {
     <>
       {alignmentLines.map((line, index) => (
         <div
-          key={index}
-          className={`${styles.alignmentLine} ${styles[line.type]}`}
+          key={`alignment-${index}-${line.position}`}
+          className={`${styles.alignmentLine} ${line.snapGuide ? styles.snapGuide : ''} ${styles[line.type] || ''}`}
           style={{
             left: `${line.position}%`,
           }}
+          title={line.type ? `Snap: ${line.type.replace('-', ' to ')}` : 'Alignment guide'}
         />
       ))}
     </>

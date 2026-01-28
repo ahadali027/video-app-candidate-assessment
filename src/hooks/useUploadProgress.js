@@ -23,17 +23,38 @@ export const useUploadProgress = () => {
       setIsUploading(true);
       setLastError(null);
 
-      // Create controller for cancellation
-      const controller = new AbortController();
-      controllerRef.current = controller;
-
       const base = process.env.REACT_APP_BACKEND_URL || '';
       const url = endpoint || `${base}gallery/upload`;
+
+      // In dev, if we don't have a token or backend URL, treat this as a mock upload
+      const isDev = process.env.NODE_ENV === 'development';
+      const hasValidBackend =
+        typeof base === 'string' &&
+        base.length > 0 &&
+        base !== 'undefined' &&
+        base !== 'null';
+
+      if (isDev && (!hasValidBackend || !token)) {
+        // Simulate progress instantly and return a minimal result structure
+        if (typeof onProgress === 'function') onProgress(100);
+        setIsUploading(false);
+        const file =
+          formData instanceof FormData ? formData.get('file') || formData.get('image') : null;
+        const mockUrl = file ? URL.createObjectURL(file) : null;
+        return {
+          data: mockUrl
+            ? { url: mockUrl, file: { url: mockUrl, name: file.name, size: file.size } }
+            : {},
+        };
+      }
+
+      // Real network upload path (used in prod or when backend+token are configured)
+      const controller = new AbortController();
+      controllerRef.current = controller;
 
       try {
         const response = await axios.post(url, formData, {
           signal: controller.signal,
-          // Don't set Content-Type explicitly; axios will set proper boundary for FormData
           headers: {
             ...(token ? { Authorization: `Bearer ${token}` } : {}),
           },
@@ -48,7 +69,6 @@ export const useUploadProgress = () => {
         if (typeof onProgress === 'function') onProgress(100);
         return { data: response.data };
       } catch (error) {
-        // Handle cancellation consistently across axios versions
         const isCanceled =
           (axios.isCancel && axios.isCancel(error)) ||
           error?.name === 'CanceledError' ||

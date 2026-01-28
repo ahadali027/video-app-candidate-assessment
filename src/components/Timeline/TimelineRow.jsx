@@ -24,6 +24,7 @@ import { uploadVideoToAWS } from '../../utils/awsUpload';
 import { saveVideoData } from '../../utils/saveVideoMetadata';
 import { user as selectUser } from '../../redux/auth/selectors';
 import { Resizable } from 'react-resizable';
+import { handleCatchError } from '../../utils/errorHandler';
 
 // Helper function to check if element types are compatible for mixing on same row
 const areTypesCompatible = (type1, type2) => {
@@ -40,9 +41,25 @@ const areTypesCompatible = (type1, type2) => {
     return true;
   }
 
-  // All other types (audio, video, imageUrl, image) can mix together
-  const mixableTypes = ['audio', 'video', 'imageUrl', 'image'];
-  return mixableTypes.includes(type1) && mixableTypes.includes(type2);
+  // Professional track separation: Video, audio, and image NEVER mix on same row
+  const videoTypes = ['video'];
+  const audioTypes = ['audio'];
+  const imageTypes = ['imageUrl', 'image'];
+  const type1IsVideo = videoTypes.includes(type1);
+  const type2IsVideo = videoTypes.includes(type2);
+  const type1IsAudio = audioTypes.includes(type1);
+  const type2IsAudio = audioTypes.includes(type2);
+  const type1IsImage = imageTypes.includes(type1);
+  const type2IsImage = imageTypes.includes(type2);
+  if (type1IsVideo && (type2IsAudio || type2IsImage)) return false;
+  if (type2IsVideo && (type1IsAudio || type1IsImage)) return false;
+  if (type1IsAudio && (type2IsVideo || type2IsImage)) return false;
+  if (type2IsAudio && (type1IsVideo || type1IsImage)) return false;
+  if (type1IsImage && (type2IsVideo || type2IsAudio)) return false;
+  if (type2IsImage && (type1IsVideo || type1IsAudio)) return false;
+
+  // Same-type tracks: only imageUrl/image can share a row
+  return type1IsImage && type2IsImage;
 };
 
 const TimelineRow = observer(
@@ -566,7 +583,7 @@ const TimelineRow = observer(
                 )
               );
 
-              store.finishMultiGhostDrag(finalPosition);
+              store.finishMultiGhostDrag(finalPosition, rowIndex);
               return;
             }
 
@@ -1463,66 +1480,26 @@ const TimelineRow = observer(
                 !overlays.length ||
                 areTypesCompatible(overlays[0]?.type, 'imageUrl')
               ) {
-                // Check if there's enough space in current row
-                const rowElements = store.editorElements.filter(
-                  el => el.row === rowIndex
-                );
+                // CRITICAL: Sequential placement - place new image AFTER last image on same row
+                const lastImageEndTime = store.getLastImageEndTime(rowIndex);
+                const startTime = lastImageEndTime; // Start after last image ends
 
-                // Find first available position
-                let startTime = 0;
-                let hasSpace = true;
-
-                if (rowElements.length > 0) {
-                  // Sort elements by start time
-                  const sortedElements = [...rowElements].sort(
-                    (a, b) => a.timeFrame.start - b.timeFrame.start
-                  );
-
-                  hasSpace = false; // Reset hasSpace before checking gaps
-
-                  // Check gaps between elements
-                  for (let i = 0; i <= sortedElements.length; i++) {
-                    const currentStart =
-                      i === 0 ? 0 : sortedElements[i - 1].timeFrame.end;
-                    const nextStart =
-                      i === sortedElements.length
-                        ? store.maxTime
-                        : sortedElements[i].timeFrame.start;
-
-                    if (nextStart - currentStart >= 5000) {
-                      // 5 seconds for images
-                      startTime = currentStart;
-                      hasSpace = true;
-                      break;
-                    }
-                  }
-                }
-
-                if (hasSpace) {
-                  // Add to current row
-                  await store.addImageLocal({
-                    url: response.data.url,
-                    minUrl: response.data.minUrl,
-                    row: rowIndex,
-                    startTime: startTime,
-                  });
-                } else {
-                  // Create new row and add element there
-                  store.shiftRowsDown(rowIndex + 1);
-                  await store.addImageLocal({
-                    url: response.data.url,
-                    minUrl: response.data.minUrl,
-                    row: rowIndex + 1,
-                    startTime: 0,
-                  });
-                }
-              } else {
-                // Add to new row if current row is not imageUrl type
                 await store.addImageLocal({
                   url: response.data.url,
                   minUrl: response.data.minUrl,
-                  row: store.maxRows,
-                  startTime: 0,
+                  row: rowIndex,
+                  startTime: startTime, // Sequential placement
+                });
+              } else {
+                // Create new row and add element there - use sequential placement on new row
+                const newRow = rowIndex + 1;
+                store.shiftRowsDown(newRow);
+                const lastImageEndTimeOnNewRow = store.getLastImageEndTime(newRow);
+                await store.addImageLocal({
+                  url: response.data.url,
+                  minUrl: response.data.minUrl,
+                  row: newRow,
+                  startTime: lastImageEndTimeOnNewRow, // Sequential placement
                 });
               }
             }
@@ -1824,6 +1801,16 @@ const TimelineRow = observer(
       );
     }, [overlays.length, rowIndex, store]);
 
+    // Determine track type for professional visual separation (video/audio/image never combine)
+    const trackType = useMemo(() => {
+      if (overlays.length === 0) return null;
+      const firstElementType = overlays[0]?.type;
+      if (firstElementType === 'video') return 'video';
+      if (firstElementType === 'audio') return 'audio';
+      if (firstElementType === 'imageUrl' || firstElementType === 'image') return 'image';
+      return null;
+    }, [overlays]);
+
     return (
       <div style={{ position: 'relative' }} data-testid="timeline-row">
         {/* Top drop zone removed - now handled in timeline-grid.jsx */}
@@ -2013,6 +2000,7 @@ const TimelineRow = observer(
               drop(node);
               dropRef.current = node;
             }}
+            data-track-type={trackType || undefined}
             className={`${styles.timelineRow} ${
               (isOver && canDrop) ||
               (isDraggingFile &&

@@ -24,16 +24,45 @@ const getAuthHeaders = () => {
  */
 export const uploadFile = async (file, options = {}) => {
   const { type = 'image', sceneId } = options;
-  
+
+  const buildMockResult = () => {
+    const fileUrl = URL.createObjectURL(file);
+    return {
+      id: `mock-${Date.now()}`,
+      url: fileUrl,
+      minUrl: fileUrl,
+      thumbnail: fileUrl,
+      name: file.name,
+      size: file.size,
+      type: file.type,
+      source: 'mock',
+      mock: true,
+    };
+  };
+
+  // In local/dev environment, or when backend URL is missing/invalid,
+  // skip network upload entirely and return a blob URL so the UI works offline.
+  const isDev = process.env.NODE_ENV === 'development';
+  const baseUrl = process.env.REACT_APP_BACKEND_URL;
+  const hasValidBackend =
+    typeof baseUrl === 'string' &&
+    baseUrl.length > 0 &&
+    baseUrl !== 'undefined' &&
+    baseUrl !== 'null';
+
+  if (isDev && !hasValidBackend) {
+    return buildMockResult();
+  }
+
   try {
     // Create FormData
     const formData = new FormData();
     formData.append('file', file);
-    
+
     if (sceneId) {
       formData.append('sceneId', sceneId);
     }
-    
+
     // Handle different file types
     switch (type) {
       case 'image': {
@@ -44,23 +73,34 @@ export const uploadFile = async (file, options = {}) => {
             id: result.id || `img-${Date.now()}`,
             url: result.url || result.googleCloudUrl,
             minUrl: result.minUrl || result.minGoogleCloudUrl,
-            ...result
+            ...result,
           };
         } catch (backendError) {
-          handleApiError(backendError, 'Failed to upload image to backend', false);
+          handleApiError(
+            backendError,
+            'Failed to upload image to backend',
+            false
+          );
           // Fallback: Use AWS S3 direct upload
-          const awsResult = await uploadImageToAWS(file, () => {});
-          
-          return {
-            id: `img-aws-${Date.now()}`,
-            url: awsResult.url,
-            key: awsResult.key,
-            source: 'aws',
-            ...awsResult
-          };
+          try {
+            const awsResult = await uploadImageToAWS(file, () => {});
+            return {
+              id: `img-aws-${Date.now()}`,
+              url: awsResult.url,
+              key: awsResult.key,
+              source: 'aws',
+              ...awsResult,
+            };
+          } catch {
+            // Final fallback: local blob URL
+            if (isDev) {
+              return buildMockResult();
+            }
+            throw backendError;
+          }
         }
       }
-      
+
       case 'video': {
         // Primary: Try backend video upload endpoint
         try {
@@ -70,34 +110,45 @@ export const uploadFile = async (file, options = {}) => {
             {
               headers: {
                 'Content-Type': 'multipart/form-data',
-                ...getAuthHeaders()
+                ...getAuthHeaders(),
               },
-              onUploadProgress: () => {}
+              onUploadProgress: () => {},
             }
           );
-          
+
           return {
             id: response.data.id || `vid-${Date.now()}`,
             url: response.data.url,
             thumbnail: response.data.thumbnail,
             duration: response.data.duration,
-            ...response.data
+            ...response.data,
           };
         } catch (backendError) {
-          handleApiError(backendError, 'Failed to upload video to backend', false);
+          handleApiError(
+            backendError,
+            'Failed to upload video to backend',
+            false
+          );
           // Fallback: Use AWS S3 direct upload
-          const awsResult = await uploadVideoToAWS(file, () => {});
-          
-          return {
-            id: `vid-aws-${Date.now()}`,
-            url: awsResult.url,
-            key: awsResult.key,
-            source: 'aws',
-            ...awsResult
-          };
+          try {
+            const awsResult = await uploadVideoToAWS(file, () => {});
+
+            return {
+              id: `vid-aws-${Date.now()}`,
+              url: awsResult.url,
+              key: awsResult.key,
+              source: 'aws',
+              ...awsResult,
+            };
+          } catch {
+            if (isDev) {
+              return buildMockResult();
+            }
+            throw backendError;
+          }
         }
       }
-      
+
       case 'audio': {
         // Primary: Try backend audio upload endpoint
         try {
@@ -107,57 +158,49 @@ export const uploadFile = async (file, options = {}) => {
             {
               headers: {
                 'Content-Type': 'multipart/form-data',
-                ...getAuthHeaders()
-              }
+                ...getAuthHeaders(),
+              },
             }
           );
-          
+
           return {
             id: response.data.id || `aud-${Date.now()}`,
             url: response.data.url,
             duration: response.data.duration,
-            ...response.data
+            ...response.data,
           };
         } catch (backendError) {
           // Fallback: Use AWS S3 direct upload
-          const awsResult = await uploadAudioToAWS(file, () => {});
-          
-          return {
-            id: `aud-aws-${Date.now()}`,
-            url: awsResult.url,
-            key: awsResult.key,
-            source: 'aws',
-            ...awsResult
-          };
+          try {
+            const awsResult = await uploadAudioToAWS(file, () => {});
+
+            return {
+              id: `aud-aws-${Date.now()}`,
+              url: awsResult.url,
+              key: awsResult.key,
+              source: 'aws',
+              ...awsResult,
+            };
+          } catch {
+            if (isDev) {
+              return buildMockResult();
+            }
+            throw backendError;
+          }
         }
       }
-      
+
       default:
         throw new Error(`Unsupported file type: ${type}`);
     }
   } catch (error) {
     console.error('File upload failed:', error);
-    
-    // Enhanced development fallback with better error reporting
-    if (process.env.NODE_ENV === 'development') {
-      if (error.code === 'ERR_NETWORK' || error.message?.includes('AWS')) {
-        
-        const fileUrl = URL.createObjectURL(file);
-        
-        return {
-          id: `mock-${Date.now()}`,
-          url: fileUrl,
-          minUrl: fileUrl,
-          thumbnail: fileUrl,
-          name: file.name,
-          size: file.size,
-          type: file.type,
-          source: 'mock',
-          mock: true
-        };
-      }
+
+    // In development, always fall back to a local blob URL
+    if (isDev) {
+      return buildMockResult();
     }
-    
+
     throw error;
   }
 };
